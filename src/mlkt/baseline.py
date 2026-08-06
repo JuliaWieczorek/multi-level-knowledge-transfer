@@ -15,9 +15,13 @@ def run_naive_baselines(
     target_column = {
         "final_intensity": "final_intensity",
         "intensity_change": "intensity_change",
+        "drop_magnitude": "drop_magnitude",
     }.get(task)
     if target_column is None:
-        raise ValueError("Task must be 'final_intensity' or 'intensity_change'.")
+        raise ValueError(
+            "Task must be 'final_intensity', 'drop_magnitude', or "
+            "'intensity_change'."
+        )
 
     metric_rows: list[dict[str, Any]] = []
     prediction_frames: list[pd.DataFrame] = []
@@ -33,7 +37,7 @@ def run_naive_baselines(
 
         for model_name, predicted in predictors.items():
             scores = classification_metrics(test[target_column], predicted)
-            if task == "final_intensity":
+            if task in {"final_intensity", "drop_magnitude"}:
                 scores.update(ordinal_metrics(test[target_column], predicted))
             metric_rows.append(
                 {
@@ -76,9 +80,13 @@ def run_tfidf_baseline(
     target_column = {
         "final_intensity": "final_intensity",
         "intensity_change": "intensity_change",
+        "drop_magnitude": "drop_magnitude",
     }.get(task)
     if target_column is None:
-        raise ValueError("Task must be 'final_intensity' or 'intensity_change'.")
+        raise ValueError(
+            "Task must be 'final_intensity', 'drop_magnitude', or "
+            "'intensity_change'."
+        )
     required = {
         "checkpoint",
         "split",
@@ -128,7 +136,7 @@ def run_tfidf_baseline(
         for split_name, split_frame in (("validation", validation), ("test", test)):
             predicted = model.predict(split_frame[text_column].fillna(""))
             scores = classification_metrics(split_frame[target_column], predicted)
-            if task == "final_intensity":
+            if task in {"final_intensity", "drop_magnitude"}:
                 scores.update(ordinal_metrics(split_frame[target_column], predicted))
             metric_rows.append(
                 {

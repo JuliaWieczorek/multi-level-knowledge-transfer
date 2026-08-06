@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multi-level-knowledge-transfer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Temporal and cross-domain emotion intensity forecasting"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,6 +17,16 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
 neural = ["torch>=2.2", "transformers>=4.45", "accelerate>=0.34"]
+augmentation = ["llama-cpp-python>=0.3"]
+analysis = ["statsmodels>=0.14", "matplotlib>=3.8"]
+all = [
+  "torch>=2.2",
+  "transformers>=4.45",
+  "accelerate>=0.34",
+  "llama-cpp-python>=0.3",
+  "statsmodels>=0.14",
+  "matplotlib>=3.8",
+]
 
 [project.scripts]
 mlkt = "mlkt.cli:main"
@@ -29,4 +39,3 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-

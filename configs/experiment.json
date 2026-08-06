@@ -1,5 +1,6 @@
 {
   "seed": 42,
+  "seeds": [42, 52, 62, 72, 82],
   "checkpoints": [0.10, 0.25, 0.50, 0.75, 1.00],
   "split": {
     "train": 0.70,
@@ -9,13 +10,71 @@
   },
   "esconv": {
     "path": "../../ESConv.json",
-    "input_view": "full_dialogue",
+    "input_view": "seeker_text",
     "require_complete_outcome": true
   },
   "meisd": {
     "path": "../../mtl-emotion-intensity-sentiment/data/MEISD_text.csv",
     "scalar_intensity_reducer": "max_active_emotion",
     "neutral_intensity": 0
+  },
+  "transfer": {
+    "esconv_da_path": "../data/ESConv_DA_ready.csv",
+    "meisd_da_path": "../data/MEISD_DA_ready.csv",
+    "esconv_checkpoints_path": "../data/processed/esconv_checkpoints.csv",
+    "prepared_dir": "../data/processed/transfer/prepared",
+    "augmented_dir": "../data/processed/transfer/augmented",
+    "augmentation": {
+      "generator": "llama-2-7b-chat-gguf",
+      "context_size": 2048,
+      "threads": 8,
+      "min_compatible_samples": 5,
+      "max_aug_per_group": 600
+    }
+  },
+  "source_mtl": {
+    "transformer_name": "bert-base-uncased",
+    "max_length": 128,
+    "batch_size": 16,
+    "epochs": 6,
+    "learning_rate": 0.00002,
+    "weight_decay": 0.01,
+    "dropout": 0.4,
+    "warmup_ratio": 0.2,
+    "focal_gamma": 2.0,
+    "soft_sharing_lambda": 0.0001,
+    "task_weights": {
+      "sentiment": 1.0,
+      "emotion": 2.0,
+      "intensity": 0.7
+    },
+    "early_stopping_patience": 3,
+    "num_workers": 0,
+    "device": "auto",
+    "output_dir": "../outputs/source_mtl"
+  },
+  "temporal": {
+    "transformer_name": "bert-base-uncased",
+    "max_length": 128,
+    "max_chunks": 32,
+    "batch_size": 4,
+    "epochs": 10,
+    "learning_rate": 0.00002,
+    "weight_decay": 0.01,
+    "dropout": 0.4,
+    "warmup_ratio": 0.1,
+    "strategy_hidden_size": 256,
+    "early_stopping_patience": 3,
+    "num_workers": 0,
+    "device": "auto",
+    "output_dir": "../outputs/temporal"
+  },
+  "strategy_analysis": {
+    "bootstrap_samples": 1000,
+    "output_dir": "../outputs/strategy_analysis"
+  },
+  "reporting": {
+    "output_dir": "../outputs/report"
   },
   "baseline": {
     "min_df": 2,
@@ -25,4 +84,3 @@
     "max_iter": 2000
   }
 }
-

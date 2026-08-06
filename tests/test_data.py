@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import pandas as pd
@@ -50,6 +51,18 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual(
             frame.iloc[-1]["strategy_count__reflection_of_feelings"], 1
         )
+        self.assertEqual(frame.iloc[-1]["drop_magnitude"], 3)
+        self.assertEqual(
+            json.loads(frame.iloc[-1]["text_seeker_turns"]),
+            ["one", "three"],
+        )
+        halfway = frame[frame["checkpoint"] == 0.5].iloc[0]
+        self.assertEqual(halfway["strategy_sequence"], "Question")
+        self.assertEqual(
+            halfway["strategy_count__reflection_of_feelings"], 0
+        )
+        earliest = frame[frame["checkpoint"] == 0.25].iloc[0]
+        self.assertEqual(earliest["n_observed_strategies"], 0)
         assert_checkpoint_integrity(
             frame, checkpoints=(0.25, 0.50, 1.00)
         )
@@ -103,4 +116,3 @@ class DataPipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

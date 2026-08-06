@@ -5,5 +5,10 @@ __pycache__/
 .venv/
 .idea/
 data/processed/*.csv
+data/processed/transfer/
+data/ESConv_DA_ready.csv
+data/MEISD_DA_ready.csv
+*.pt
+*.safetensors
 outputs/**
 !outputs/.gitkeep

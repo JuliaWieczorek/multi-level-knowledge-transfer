@@ -10,6 +10,16 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 
 DEFAULT_CHECKPOINTS = (0.10, 0.25, 0.50, 0.75, 1.00)
+ESCONV_STRATEGIES = (
+    "Question",
+    "Others",
+    "Providing Suggestions",
+    "Affirmation and Reassurance",
+    "Self-disclosure",
+    "Reflection of feelings",
+    "Information",
+    "Restatement or Paraphrasing",
+)
 
 
 def _validate_checkpoints(checkpoints: Sequence[float]) -> tuple[float, ...]:
@@ -51,23 +61,79 @@ def _strategy_slug(strategy: str) -> str:
     return slug or "unknown"
 
 
-def _strategy_features(sequence: Sequence[str]) -> dict[str, Any]:
+def _strategy_features(
+    sequence: Sequence[str],
+    turn_positions: Sequence[int],
+    n_observed_turns: int,
+    n_supporter_turns: int,
+) -> dict[str, Any]:
+    if len(sequence) != len(turn_positions):
+        raise ValueError("Strategy labels and turn positions must have equal length.")
     counts = Counter(sequence)
     total = len(sequence)
+    denominator = max(n_observed_turns - 1, 1)
+    normalised_positions = [position / denominator for position in turn_positions]
     result: dict[str, Any] = {
         "strategy_sequence": " > ".join(sequence),
+        "strategy_turn_positions": " | ".join(str(position) for position in turn_positions),
+        "strategy_positions_normalized": " | ".join(
+            f"{position:.8f}" for position in normalised_positions
+        ),
         "n_observed_strategies": total,
         "n_unique_strategies": len(counts),
+        "n_observed_supporter_turns": n_supporter_turns,
         "first_strategy": sequence[0] if sequence else "",
         "last_strategy": sequence[-1] if sequence else "",
         "strategy_transitions": " | ".join(
             f"{left} -> {right}" for left, right in zip(sequence, sequence[1:])
         ),
+        "strategy_first_position": (
+            normalised_positions[0] if normalised_positions else -1.0
+        ),
+        "strategy_mean_position": (
+            sum(normalised_positions) / total if normalised_positions else -1.0
+        ),
+        "strategy_last_position": (
+            normalised_positions[-1] if normalised_positions else -1.0
+        ),
+        "strategy_early_share": (
+            sum(position <= 0.5 for position in normalised_positions) / total
+            if total
+            else 0.0
+        ),
+        "strategy_late_share": (
+            sum(position > 0.5 for position in normalised_positions) / total
+            if total
+            else 0.0
+        ),
     }
-    for strategy, count in counts.items():
+    for strategy in ESCONV_STRATEGIES:
+        count = counts.get(strategy, 0)
         slug = _strategy_slug(strategy)
         result[f"strategy_count__{slug}"] = count
-        result[f"strategy_rate__{slug}"] = count / total if total else 0.0
+        result[f"strategy_rate__{slug}"] = (
+            count / n_supporter_turns if n_supporter_turns else 0.0
+        )
+        positions = [
+            position
+            for label, position in zip(sequence, normalised_positions)
+            if label == strategy
+        ]
+        result[f"strategy_first__{slug}"] = positions[0] if positions else -1.0
+        result[f"strategy_mean__{slug}"] = (
+            sum(positions) / len(positions) if positions else -1.0
+        )
+        result[f"strategy_last__{slug}"] = positions[-1] if positions else -1.0
+    for left, right in zip(sequence, sequence[1:]):
+        result[
+            f"strategy_transition__{_strategy_slug(left)}__{_strategy_slug(right)}"
+        ] = (
+            result.get(
+                f"strategy_transition__{_strategy_slug(left)}__{_strategy_slug(right)}",
+                0,
+            )
+            + 1
+        )
     return result
 
 
@@ -116,12 +182,25 @@ def build_esconv_checkpoints(
                 for turn in observed
                 if turn.get("speaker") == "supporter"
             )
-            strategies = [
-                _normalise_text(turn.get("annotation", {}).get("strategy"))
+            seeker_turns = [
+                _normalise_text(turn.get("content"))
                 for turn in observed
-                if turn.get("speaker") == "supporter"
-                and _normalise_text(turn.get("annotation", {}).get("strategy"))
+                if turn.get("speaker") == "seeker"
             ]
+            supporter_turns = [
+                turn for turn in observed if turn.get("speaker") == "supporter"
+            ]
+            strategies: list[str] = []
+            strategy_positions: list[int] = []
+            for turn_index, turn in enumerate(observed):
+                if turn.get("speaker") != "supporter":
+                    continue
+                strategy = _normalise_text(
+                    turn.get("annotation", {}).get("strategy")
+                )
+                if strategy:
+                    strategies.append(strategy)
+                    strategy_positions.append(turn_index)
             row = {
                 "dataset": "esconv",
                 "conversation_id": conversation_id,
@@ -132,15 +211,24 @@ def build_esconv_checkpoints(
                 "observed_fraction_actual": len(observed) / len(turns),
                 "text": all_text,
                 "text_seeker": seeker_text,
+                "text_seeker_turns": json.dumps(seeker_turns, ensure_ascii=False),
                 "text_supporter": supporter_text,
                 "initial_intensity": initial,
                 "final_intensity": final,
                 "intensity_delta": final - initial,
+                "drop_magnitude": initial - final,
                 "intensity_change": change_label(initial, final),
                 "emotion": _normalise_text(conversation.get("emotion_type")),
                 "problem_type": _normalise_text(conversation.get("problem_type")),
             }
-            row.update(_strategy_features(strategies))
+            row.update(
+                _strategy_features(
+                    strategies,
+                    strategy_positions,
+                    n_observed_turns=len(observed),
+                    n_supporter_turns=len(supporter_turns),
+                )
+            )
             rows.append(row)
 
     frame = pd.DataFrame(rows)
@@ -148,7 +236,9 @@ def build_esconv_checkpoints(
         strategy_columns = [
             column
             for column in frame.columns
-            if column.startswith("strategy_count__") or column.startswith("strategy_rate__")
+            if column.startswith("strategy_count__")
+            or column.startswith("strategy_rate__")
+            or column.startswith("strategy_transition__")
         ]
         frame[strategy_columns] = frame[strategy_columns].fillna(0)
     return frame
@@ -226,10 +316,14 @@ def build_meisd_checkpoints(
                     "n_observed_turns": observed_count,
                     "observed_fraction_actual": observed_count / len(dialogue),
                     "text": " ".join(texts[:observed_count]),
+                    "text_turns": json.dumps(
+                        texts[:observed_count], ensure_ascii=False
+                    ),
                     "initial_intensity": initial,
                     "current_intensity": int(observed["_turn_intensity"].iloc[-1]),
                     "final_intensity": final,
                     "intensity_delta": final - initial,
+                    "drop_magnitude": initial - final,
                     "intensity_change": change_label(initial, final),
                     "tv_series": str(series),
                 }
@@ -259,4 +353,3 @@ def assert_checkpoint_integrity(
             raise ValueError(f"{conversation_id} has non-monotonic observed turn counts.")
         if (ordered["n_observed_turns"] > ordered["n_total_turns"]).any():
             raise ValueError(f"{conversation_id} observes turns beyond the dialogue boundary.")
-
