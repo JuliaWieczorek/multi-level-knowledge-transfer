@@ -1,0 +1,28 @@
+{
+  "seed": 42,
+  "checkpoints": [0.10, 0.25, 0.50, 0.75, 1.00],
+  "split": {
+    "train": 0.70,
+    "validation": 0.15,
+    "test": 0.15,
+    "stratify_by": "final_intensity"
+  },
+  "esconv": {
+    "path": "../../ESConv.json",
+    "input_view": "full_dialogue",
+    "require_complete_outcome": true
+  },
+  "meisd": {
+    "path": "../../mtl-emotion-intensity-sentiment/data/MEISD_text.csv",
+    "scalar_intensity_reducer": "max_active_emotion",
+    "neutral_intensity": 0
+  },
+  "baseline": {
+    "min_df": 2,
+    "max_features": 50000,
+    "ngram_range": [1, 2],
+    "class_weight": "balanced",
+    "max_iter": 2000
+  }
+}
+
