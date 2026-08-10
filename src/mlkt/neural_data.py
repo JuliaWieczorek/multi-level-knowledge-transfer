@@ -103,7 +103,7 @@ class SourceMTLDataset(Dataset):
     def __len__(self) -> int:
         return len(self.frame)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.frame.iloc[index]
         encoded = self.tokenizer(
             str(row["Utterances"]),
@@ -126,6 +126,14 @@ class SourceMTLDataset(Dataset):
             dtype=np.int64,
         )
         return {
+            "row_id": int(index),
+            "conversation_id": str(row["conversation_id"]),
+            "source_conversation_id": str(
+                row.get("source_conversation_id", row["conversation_id"])
+            ),
+            "augmented": bool(row.get("augmented", False)),
+            "generation_valid": bool(row.get("generation_valid", True)),
+            "generation_quality": float(row.get("quality", 1.0)),
             "input_ids": encoded["input_ids"].squeeze(0),
             "attention_mask": encoded["attention_mask"].squeeze(0),
             "sentiment": torch.tensor(
@@ -145,6 +153,9 @@ class TemporalDataset(Dataset):
         strategy_mode: str = "quantity_timing_order",
         max_length: int = 128,
         max_chunks: int = 32,
+        use_initial_intensity: bool = False,
+        initial_intensity_mean: float | None = None,
+        initial_intensity_std: float | None = None,
     ) -> None:
         self.frame = ensure_strategy_columns(frame).reset_index(drop=True)
         self.tokenizer = tokenizer
@@ -152,8 +163,19 @@ class TemporalDataset(Dataset):
         self.strategy_columns = strategy_feature_columns(strategy_mode)
         self.max_length = max_length
         self.max_chunks = max_chunks
+        self.use_initial_intensity = use_initial_intensity
+        self.initial_intensity_mean = initial_intensity_mean
+        self.initial_intensity_std = initial_intensity_std
         if "text" in modality and tokenizer is None:
             raise ValueError("Text modalities require a tokenizer.")
+        if use_initial_intensity and modality != "text_strategy":
+            raise ValueError("Initial intensity is supported only for text_strategy.")
+        if use_initial_intensity and (
+            initial_intensity_mean is None
+            or initial_intensity_std is None
+            or initial_intensity_std <= 0
+        ):
+            raise ValueError("Initial-aware datasets require train-derived mean and std.")
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -164,7 +186,12 @@ class TemporalDataset(Dataset):
             "conversation_id": str(row["conversation_id"]),
             "final_target": int(row["final_intensity"]) - 1,
             "drop_target": int(row["drop_magnitude"]) - 1,
+            "initial_intensity": int(row["initial_intensity"]),
         }
+        if self.use_initial_intensity:
+            item["initial_feature"] = (
+                float(row["initial_intensity"]) - float(self.initial_intensity_mean)
+            ) / float(self.initial_intensity_std)
         if "text" in self.modality:
             turns = json.loads(row["text_seeker_turns"])
             item["chunks"] = tokenize_turn_chunks(
@@ -203,7 +230,14 @@ def temporal_collate(
         "drop_target": torch.tensor(
             [item["drop_target"] for item in items], dtype=torch.long
         ),
+        "initial_intensity": torch.tensor(
+            [item["initial_intensity"] for item in items], dtype=torch.long
+        ),
     }
+    if "initial_feature" in items[0]:
+        batch["initial_feature"] = torch.tensor(
+            [[item["initial_feature"]] for item in items], dtype=torch.float
+        )
     if "chunks" in items[0]:
         max_chunks = max(len(item["chunks"]) for item in items)
         token_length = len(items[0]["chunks"][0]["input_ids"])

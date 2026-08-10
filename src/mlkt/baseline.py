@@ -11,7 +11,7 @@ def run_naive_baselines(
     frame: pd.DataFrame,
     task: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Evaluate training-majority and, for intensity, initial-value persistence."""
+    """Evaluate the training-majority baseline."""
     target_column = {
         "final_intensity": "final_intensity",
         "intensity_change": "intensity_change",
@@ -29,16 +29,17 @@ def run_naive_baselines(
         train = checkpoint_frame[checkpoint_frame["split"] == "train"]
         test = checkpoint_frame[checkpoint_frame["split"] == "test"]
         majority = train[target_column].mode().iloc[0]
-        predictors: dict[str, Any] = {
-            "majority": [majority] * len(test),
-        }
-        if task == "final_intensity":
-            predictors["initial_persistence"] = test["initial_intensity"].to_numpy()
+        predictors: dict[str, Any] = {"majority": [majority] * len(test)}
 
         for model_name, predicted in predictors.items():
-            scores = classification_metrics(test[target_column], predicted)
+            labels = (1, 2, 3, 4) if task in {"final_intensity", "drop_magnitude"} else None
+            scores = classification_metrics(
+                test[target_column], predicted, labels=labels
+            )
             if task in {"final_intensity", "drop_magnitude"}:
-                scores.update(ordinal_metrics(test[target_column], predicted))
+                scores.update(
+                    ordinal_metrics(test[target_column], predicted, labels=(1, 2, 3, 4))
+                )
             metric_rows.append(
                 {
                     "checkpoint": checkpoint,
@@ -135,9 +136,16 @@ def run_tfidf_baseline(
         model.fit(train[text_column].fillna(""), train[target_column])
         for split_name, split_frame in (("validation", validation), ("test", test)):
             predicted = model.predict(split_frame[text_column].fillna(""))
-            scores = classification_metrics(split_frame[target_column], predicted)
+            labels = (1, 2, 3, 4) if task in {"final_intensity", "drop_magnitude"} else None
+            scores = classification_metrics(
+                split_frame[target_column], predicted, labels=labels
+            )
             if task in {"final_intensity", "drop_magnitude"}:
-                scores.update(ordinal_metrics(split_frame[target_column], predicted))
+                scores.update(
+                    ordinal_metrics(
+                        split_frame[target_column], predicted, labels=(1, 2, 3, 4)
+                    )
+                )
             metric_rows.append(
                 {
                     "checkpoint": checkpoint,
@@ -156,5 +164,72 @@ def run_tfidf_baseline(
             predictions["split"] = split_name
             predictions["task"] = task
             predictions["model"] = "tfidf_logistic_regression"
+            prediction_frames.append(predictions)
+    return pd.DataFrame(metric_rows), pd.concat(prediction_frames, ignore_index=True)
+
+
+def run_initial_only_baseline(
+    frame: pd.DataFrame,
+    task: str,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit checkpoint-specific logistic regression using only initial intensity."""
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+    except ImportError as error:
+        raise RuntimeError("The baseline requires scikit-learn.") from error
+    target_column = {
+        "final_intensity": "final_intensity",
+        "drop_magnitude": "drop_magnitude",
+    }.get(task)
+    if target_column is None:
+        raise ValueError("Initial-only baseline supports final_intensity or drop_magnitude.")
+    metric_rows: list[dict[str, Any]] = []
+    prediction_frames: list[pd.DataFrame] = []
+    for checkpoint, checkpoint_frame in frame.groupby("checkpoint", sort=True):
+        train = checkpoint_frame[checkpoint_frame["split"] == "train"]
+        for split_name in ("validation", "test"):
+            subset = checkpoint_frame[checkpoint_frame["split"] == split_name]
+            model = Pipeline(
+                [
+                    ("scale", StandardScaler()),
+                    (
+                        "classifier",
+                        LogisticRegression(
+                            class_weight="balanced", max_iter=2000, random_state=seed
+                        ),
+                    ),
+                ]
+            )
+            model.fit(train[["initial_intensity"]], train[target_column])
+            predicted = model.predict(subset[["initial_intensity"]])
+            scores = classification_metrics(
+                subset[target_column], predicted, labels=(1, 2, 3, 4)
+            )
+            scores.update(
+                ordinal_metrics(
+                    subset[target_column], predicted, labels=(1, 2, 3, 4)
+                )
+            )
+            metric_rows.append(
+                {
+                    "checkpoint": checkpoint,
+                    "checkpoint_percent": int(round(float(checkpoint) * 100)),
+                    "split": split_name,
+                    "task": task,
+                    "model": "initial_only_logistic_regression",
+                    **scores,
+                }
+            )
+            predictions = subset[
+                ["dataset", "conversation_id", "checkpoint", "initial_intensity", target_column]
+            ].copy()
+            predictions = predictions.rename(columns={target_column: "target"})
+            predictions["prediction"] = predicted
+            predictions["split"] = split_name
+            predictions["task"] = task
+            predictions["model"] = "initial_only_logistic_regression"
             prediction_frames.append(predictions)
     return pd.DataFrame(metric_rows), pd.concat(prediction_frames, ignore_index=True)

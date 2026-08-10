@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import random
+import sys
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -13,9 +16,18 @@ import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
-from .metrics import classification_metrics, ordinal_metrics
+from .metrics import (
+    classification_metrics,
+    confusion_matrix_records,
+    joint_prediction_diagnostics,
+    multilabel_per_label_metrics,
+    multilabel_metrics,
+    ordinal_metrics,
+    per_class_metrics,
+)
 from .models import (
     BinaryFocalLoss,
     SoftSharingMTL,
@@ -24,6 +36,7 @@ from .models import (
 )
 from .neural_data import SourceMTLDataset, TemporalDataset, temporal_collate
 from .strategy import strategy_feature_columns, strategy_vocabulary
+from .validation import validate_augmentation_artifacts, validate_source_training_frame
 
 
 def set_seed(seed: int) -> None:
@@ -32,6 +45,9 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def resolve_device(requested: str = "auto") -> torch.device:
@@ -57,6 +73,14 @@ def _move_tensors(batch: dict[str, Any], device: torch.device) -> dict[str, Any]
         key: value.to(device) if isinstance(value, torch.Tensor) else value
         for key, value in batch.items()
     }
+
+
+def _append_progress(path: Path, event: dict[str, Any]) -> None:
+    record = {"timestamp_unix": time.time(), **event}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        handle.flush()
 
 
 def _source_loss(
@@ -100,24 +124,69 @@ def _run_source_epoch(
     emotion_loss: nn.Module,
     task_weights: dict[str, float],
     soft_sharing_lambda: float,
+    emotion_names: Sequence[str],
+    emotion_threshold: float,
     optimizer: AdamW | None = None,
     scheduler: Any | None = None,
-) -> dict[str, float]:
+    collect_predictions: bool = False,
+    progress_description: str | None = None,
+    progress_position: int = 0,
+) -> tuple[dict[str, float], pd.DataFrame | None, dict[str, np.ndarray] | None]:
     training = optimizer is not None
     model.train(training)
     losses: list[float] = []
+    component_losses: dict[str, list[float]] = {
+        "sentiment_loss": [],
+        "emotion_loss": [],
+        "intensity_loss": [],
+        "sharing_loss": [],
+    }
     sentiment_true: list[int] = []
     sentiment_pred: list[int] = []
-    emotion_true: list[int] = []
-    emotion_pred: list[int] = []
+    sentiment_probabilities: list[list[float]] = []
+    emotion_true: list[list[int]] = []
+    emotion_pred: list[list[int]] = []
+    emotion_probabilities: list[list[float]] = []
+    intensity_true_matrix: list[list[int]] = []
+    intensity_pred_matrix: list[list[int]] = []
+    intensity_probabilities: list[list[list[float]]] = []
     intensity_true: list[int] = []
     intensity_pred: list[int] = []
+    metadata_rows: list[dict[str, Any]] = []
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
-        for batch in loader:
-            batch = _move_tensors(batch, device)
+        iterator = tqdm(
+            loader,
+            desc=progress_description,
+            unit="batch",
+            position=progress_position,
+            leave=False,
+            dynamic_ncols=True,
+            disable=progress_description is None,
+        )
+        for batch_index, raw_batch in enumerate(iterator, start=1):
+            if collect_predictions:
+                batch_size = len(raw_batch["conversation_id"])
+                for index in range(batch_size):
+                    metadata_rows.append(
+                        {
+                            "row_id": int(raw_batch["row_id"][index]),
+                            "conversation_id": str(raw_batch["conversation_id"][index]),
+                            "source_conversation_id": str(
+                                raw_batch["source_conversation_id"][index]
+                            ),
+                            "augmented": bool(raw_batch["augmented"][index]),
+                            "generation_valid": bool(
+                                raw_batch["generation_valid"][index]
+                            ),
+                            "generation_quality": float(
+                                raw_batch["generation_quality"][index]
+                            ),
+                        }
+                    )
+            batch = _move_tensors(raw_batch, device)
             outputs = model(batch["input_ids"], batch["attention_mask"])
-            loss, _ = _source_loss(
+            loss, loss_parts = _source_loss(
                 model,
                 outputs,
                 batch,
@@ -134,40 +203,51 @@ def _run_source_epoch(
                 if scheduler is not None:
                     scheduler.step()
             losses.append(float(loss.detach().cpu()))
+            for name, value in loss_parts.items():
+                component_losses[name].append(value)
+            if batch_index == 1 or batch_index % 10 == 0 or batch_index == len(loader):
+                iterator.set_postfix(loss=f"{np.mean(losses):.4f}")
+            sentiment_probability = torch.softmax(outputs["sentiment"], dim=-1)
             sentiment_true.extend(batch["sentiment"].detach().cpu().tolist())
             sentiment_pred.extend(
                 outputs["sentiment"].argmax(dim=-1).detach().cpu().tolist()
             )
-            emotion_true.extend(
-                batch["emotion"].detach().cpu().to(torch.int).flatten().tolist()
-            )
-            emotion_pred.extend(
-                (torch.sigmoid(outputs["emotion"]) >= 0.4)
-                .to(torch.int)
-                .detach()
-                .cpu()
-                .flatten()
-                .tolist()
-            )
+            sentiment_probabilities.extend(sentiment_probability.detach().cpu().tolist())
+            emotion_probability = torch.sigmoid(outputs["emotion"])
+            emotion_prediction = (emotion_probability >= emotion_threshold).to(torch.int)
+            emotion_true.extend(batch["emotion"].detach().cpu().to(torch.int).tolist())
+            emotion_pred.extend(emotion_prediction.detach().cpu().tolist())
+            emotion_probabilities.extend(emotion_probability.detach().cpu().tolist())
+            intensity_probability = torch.softmax(outputs["intensity"], dim=-1)
+            intensity_prediction = outputs["intensity"].argmax(dim=-1)
+            intensity_true_matrix.extend(batch["intensity"].detach().cpu().tolist())
+            intensity_pred_matrix.extend(intensity_prediction.detach().cpu().tolist())
+            intensity_probabilities.extend(intensity_probability.detach().cpu().tolist())
             active = batch["intensity"] >= 0
             intensity_true.extend(batch["intensity"][active].detach().cpu().tolist())
             intensity_pred.extend(
-                outputs["intensity"][active].argmax(dim=-1).detach().cpu().tolist()
+                intensity_prediction[active].detach().cpu().tolist()
             )
     metrics = {"loss": float(np.mean(losses))}
+    metrics.update(
+        {name: float(np.mean(values)) for name, values in component_losses.items()}
+    )
     metrics.update(
         {
             f"sentiment_{key}": value
             for key, value in classification_metrics(
-                sentiment_true, sentiment_pred
+                sentiment_true, sentiment_pred, labels=(0, 1, 2)
             ).items()
         }
     )
+    emotion_true_array = np.asarray(emotion_true, dtype=int)
+    emotion_pred_array = np.asarray(emotion_pred, dtype=int)
+    emotion_probability_array = np.asarray(emotion_probabilities, dtype=float)
     metrics.update(
         {
             f"emotion_{key}": value
-            for key, value in classification_metrics(
-                emotion_true, emotion_pred
+            for key, value in multilabel_metrics(
+                emotion_true_array, emotion_pred_array, emotion_probability_array
             ).items()
         }
     )
@@ -176,11 +256,142 @@ def _run_source_epoch(
             {
                 f"intensity_{key}": value
                 for key, value in classification_metrics(
-                    intensity_true, intensity_pred
+                    intensity_true, intensity_pred, labels=(0, 1, 2)
                 ).items()
             }
         )
-    return metrics
+        metrics.update(
+            {
+                f"intensity_{key}": value
+                for key, value in ordinal_metrics(
+                    intensity_true, intensity_pred, labels=(0, 1, 2)
+                ).items()
+            }
+        )
+    if not collect_predictions:
+        return metrics, None, None
+
+    predictions = pd.DataFrame(metadata_rows)
+    predictions["sentiment_target"] = sentiment_true
+    predictions["sentiment_prediction"] = sentiment_pred
+    sentiment_names = ("negative", "neutral", "positive")
+    for index, name in enumerate(sentiment_names):
+        predictions[f"sentiment_probability__{name}"] = np.asarray(
+            sentiment_probabilities
+        )[:, index]
+    for index, name in enumerate(emotion_names):
+        predictions[f"emotion_target__{name}"] = emotion_true_array[:, index]
+        predictions[f"emotion_prediction__{name}"] = emotion_pred_array[:, index]
+        predictions[f"emotion_probability__{name}"] = emotion_probability_array[:, index]
+        raw_intensity = np.asarray(intensity_true_matrix)[:, index]
+        predictions[f"intensity_target__{name}"] = np.where(
+            raw_intensity >= 0, raw_intensity + 1, np.nan
+        )
+        predictions[f"intensity_prediction__{name}"] = (
+            np.asarray(intensity_pred_matrix)[:, index] + 1
+        )
+        for intensity_index in range(3):
+            predictions[f"intensity_probability__{name}__{intensity_index + 1}"] = (
+                np.asarray(intensity_probabilities)[:, index, intensity_index]
+            )
+    details = {
+        "sentiment_true": np.asarray(sentiment_true),
+        "sentiment_pred": np.asarray(sentiment_pred),
+        "emotion_true": emotion_true_array,
+        "emotion_pred": emotion_pred_array,
+        "emotion_probability": emotion_probability_array,
+        "intensity_true": np.asarray(intensity_true_matrix),
+        "intensity_pred": np.asarray(intensity_pred_matrix),
+    }
+    return metrics, predictions, details
+
+
+def _source_diagnostic_tables(
+    details: dict[str, np.ndarray], emotion_names: Sequence[str]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    metric_rows: list[dict[str, Any]] = []
+    confusion_rows: list[dict[str, Any]] = []
+    sentiment_names = ("negative", "neutral", "positive")
+    for row in per_class_metrics(
+        details["sentiment_true"],
+        details["sentiment_pred"],
+        labels=(0, 1, 2),
+        label_names=sentiment_names,
+    ):
+        metric_rows.append({"task": "sentiment", "emotion": "", **row})
+    for row in confusion_matrix_records(
+        details["sentiment_true"], details["sentiment_pred"], labels=(0, 1, 2)
+    ):
+        confusion_rows.append({"task": "sentiment", "emotion": "", **row})
+
+    for index, emotion in enumerate(emotion_names):
+        true_emotion = details["emotion_true"][:, index]
+        pred_emotion = details["emotion_pred"][:, index]
+        for row in per_class_metrics(
+            true_emotion,
+            pred_emotion,
+            labels=(0, 1),
+            label_names=("absent", "present"),
+        ):
+            metric_rows.append({"task": "emotion", "emotion": emotion, **row})
+        for row in confusion_matrix_records(true_emotion, pred_emotion, labels=(0, 1)):
+            confusion_rows.append({"task": "emotion", "emotion": emotion, **row})
+
+        true_intensity = details["intensity_true"][:, index]
+        active = true_intensity >= 0
+        if active.any():
+            pred_intensity = details["intensity_pred"][:, index][active]
+            true_intensity_display = true_intensity[active] + 1
+            pred_intensity_display = pred_intensity + 1
+            intensity_summary = classification_metrics(
+                true_intensity_display, pred_intensity_display, labels=(1, 2, 3)
+            )
+            intensity_summary.update(
+                ordinal_metrics(
+                    true_intensity_display, pred_intensity_display, labels=(1, 2, 3)
+                )
+            )
+            metric_rows.append(
+                {
+                    "task": "emotion_intensity_summary",
+                    "emotion": emotion,
+                    "label": "all",
+                    "label_name": "all",
+                    "support": int(active.sum()),
+                    **intensity_summary,
+                }
+            )
+            for row in per_class_metrics(
+                true_intensity_display,
+                pred_intensity_display,
+                labels=(1, 2, 3),
+                label_names=("1", "2", "3"),
+            ):
+                metric_rows.append(
+                    {"task": "emotion_intensity", "emotion": emotion, **row}
+                )
+            for row in confusion_matrix_records(
+                true_intensity_display, pred_intensity_display, labels=(1, 2, 3)
+            ):
+                confusion_rows.append(
+                    {"task": "emotion_intensity", "emotion": emotion, **row}
+                )
+    emotion_probability_rows = multilabel_per_label_metrics(
+        details["emotion_true"],
+        details["emotion_pred"],
+        details["emotion_probability"],
+        emotion_names,
+    )
+    for row in emotion_probability_rows:
+        metric_rows.append(
+            {
+                "task": "emotion_summary",
+                "emotion": row.pop("label_name"),
+                "label": 1,
+                **row,
+            }
+        )
+    return pd.DataFrame(metric_rows), pd.DataFrame(confusion_rows)
 
 
 def pretrain_source_mtl(
@@ -188,7 +399,9 @@ def pretrain_source_mtl(
     output_dir: str | Path,
     seed: int,
     config: dict[str, Any],
+    progress_position: int = 0,
 ) -> dict[str, Any]:
+    started_at = time.time()
     set_seed(seed)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -200,6 +413,23 @@ def pretrain_source_mtl(
     )
     if not emotion_names:
         raise ValueError("Source data has no one-hot emotion columns.")
+    augmentation_report = validate_augmentation_artifacts(source_path, frame)
+    frame, input_report = validate_source_training_frame(
+        frame,
+        emotion_names,
+        exclude_invalid_generations=config.get(
+            "exclude_invalid_generations", True
+        ),
+        drop_exact_train_duplicates=config.get(
+            "drop_exact_train_duplicates", True
+        ),
+        drop_conflicting_train_texts=config.get(
+            "drop_conflicting_train_texts", True
+        ),
+    )
+    input_report["augmentation_artifacts"] = augmentation_report
+    with (output / "source_input_report.json").open("w", encoding="utf-8") as handle:
+        json.dump(input_report, handle, indent=2, sort_keys=True)
     train = frame[frame["split"] == "train"].copy()
     validation = frame[frame["split"] == "validation"].copy()
     if train.empty or validation.empty:
@@ -264,10 +494,16 @@ def pretrain_source_mtl(
         num_training_steps=total_steps,
     )
     task_weights = config["task_weights"]
+    emotion_threshold = float(config.get("emotion_threshold", 0.4))
     history: list[dict[str, Any]] = []
     best_loss = float("inf")
     best_epoch = 0
     checkpoint_path = output / "source_transfer_checkpoint.pt"
+    progress_path = output / "source_training_progress.jsonl"
+    _append_progress(
+        progress_path,
+        {"event": "run_started", "run_type": "source_mtl", "seed": seed},
+    )
     source_split_hash = _split_hash(frame)
     with (output / "run_config.json").open("w", encoding="utf-8") as handle:
         json.dump(
@@ -277,14 +513,42 @@ def pretrain_source_mtl(
                 "source_path": str(Path(source_path).resolve()),
                 "source_sha256": _file_hash(source_path),
                 "split_hash": source_split_hash,
+                "emotion_names": emotion_names,
+                "emotion_threshold": emotion_threshold,
+                "class_weights": {
+                    "sentiment": sentiment_weights.detach().cpu().tolist(),
+                    "emotion_alpha": emotion_alpha.detach().cpu().tolist(),
+                },
+                "input_report": input_report,
+                "environment": {
+                    "python": sys.version,
+                    "platform": platform.platform(),
+                    "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "cuda_available": torch.cuda.is_available(),
+                    "gpu": (
+                        torch.cuda.get_device_name(0)
+                        if torch.cuda.is_available()
+                        else None
+                    ),
+                },
                 "config": config,
             },
             handle,
             indent=2,
             sort_keys=True,
         )
-    for epoch in range(1, config["epochs"] + 1):
-        train_metrics = _run_source_epoch(
+    epoch_iterator = tqdm(
+        range(1, config["epochs"] + 1),
+        desc=f"Source seed {seed}",
+        unit="epoch",
+        position=progress_position,
+        leave=True,
+        dynamic_ncols=True,
+    )
+    for epoch in epoch_iterator:
+        epoch_started = time.time()
+        train_metrics, _, _ = _run_source_epoch(
             model,
             train_loader,
             device,
@@ -292,10 +556,14 @@ def pretrain_source_mtl(
             emotion_loss,
             task_weights,
             config["soft_sharing_lambda"],
+            emotion_names,
+            emotion_threshold,
             optimizer,
             scheduler,
+            progress_description=f"seed {seed} epoch {epoch} train",
+            progress_position=progress_position + 1,
         )
-        validation_metrics = _run_source_epoch(
+        validation_metrics, validation_predictions, validation_details = _run_source_epoch(
             model,
             validation_loader,
             device,
@@ -303,13 +571,28 @@ def pretrain_source_mtl(
             emotion_loss,
             task_weights,
             config["soft_sharing_lambda"],
+            emotion_names,
+            emotion_threshold,
+            collect_predictions=True,
+            progress_description=f"seed {seed} epoch {epoch} validation",
+            progress_position=progress_position + 1,
         )
         history.append(
             {
                 "epoch": epoch,
                 "train": train_metrics,
                 "validation": validation_metrics,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "duration_seconds": time.time() - epoch_started,
             }
+        )
+        _append_progress(
+            progress_path,
+            {
+                "event": "epoch_completed",
+                "seed": seed,
+                **history[-1],
+            },
         )
         if validation_metrics["loss"] < best_loss:
             best_loss = validation_metrics["loss"]
@@ -325,6 +608,39 @@ def pretrain_source_mtl(
                 },
                 checkpoint_path,
             )
+            assert validation_predictions is not None
+            assert validation_details is not None
+            validation_predictions["split"] = "validation"
+            validation_predictions["seed"] = seed
+            validation_predictions["best_epoch"] = best_epoch
+            validation_predictions.to_csv(
+                output / "source_validation_predictions.csv", index=False
+            )
+            with (output / "source_validation_metrics.json").open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(validation_metrics, handle, indent=2, sort_keys=True)
+            pd.DataFrame(
+                [{"seed": seed, "best_epoch": best_epoch, **validation_metrics}]
+            ).to_csv(output / "source_validation_metrics.csv", index=False)
+            per_class, confusion = _source_diagnostic_tables(
+                validation_details, emotion_names
+            )
+            per_class.to_csv(
+                output / "source_validation_per_class_metrics.csv", index=False
+            )
+            confusion.to_csv(
+                output / "source_validation_confusion_matrices.csv", index=False
+            )
+            tqdm.write(
+                f"[source seed {seed}] saved best checkpoint at epoch {best_epoch} "
+                f"(validation loss={best_loss:.4f})"
+            )
+        epoch_iterator.set_postfix(
+            val_loss=f"{validation_metrics['loss']:.4f}",
+            emotion_f1=f"{validation_metrics['emotion_f1_macro']:.4f}",
+            best_epoch=best_epoch or "-",
+        )
         if epoch - best_epoch >= config["early_stopping_patience"]:
             break
     with (output / "source_training_history.json").open(
@@ -339,9 +655,13 @@ def pretrain_source_mtl(
         "split_hash": source_split_hash,
         "emotion_names": emotion_names,
         "device": str(device),
+        "emotion_threshold": emotion_threshold,
+        "input_report": input_report,
+        "duration_seconds": time.time() - started_at,
     }
     with (output / "source_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+    _append_progress(progress_path, {"event": "run_completed", **summary})
     return summary
 
 
@@ -372,22 +692,38 @@ def _run_temporal_epoch(
     drop_weights: torch.Tensor,
     optimizer: AdamW | None = None,
     scheduler: Any | None = None,
+    progress_description: str | None = None,
+    progress_position: int = 0,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     training = optimizer is not None
     model.train(training)
     losses: list[float] = []
+    component_losses: dict[str, list[float]] = {"final_loss": [], "drop_loss": []}
     identifiers: list[str] = []
+    initial_values: list[int] = []
     final_true: list[int] = []
     final_pred: list[int] = []
     drop_true: list[int] = []
     drop_pred: list[int] = []
+    final_probabilities: list[list[float]] = []
+    drop_probabilities: list[list[float]] = []
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
-        for raw_batch in loader:
+        iterator = tqdm(
+            loader,
+            desc=progress_description,
+            unit="batch",
+            position=progress_position,
+            leave=False,
+            dynamic_ncols=True,
+            disable=progress_description is None,
+        )
+        for batch_index, raw_batch in enumerate(iterator, start=1):
             identifiers.extend(raw_batch["conversation_id"])
+            initial_values.extend(raw_batch["initial_intensity"].tolist())
             batch = _move_tensors(raw_batch, device)
             outputs = model(batch)
-            loss, _ = temporal_multitask_loss(
+            loss, loss_parts = temporal_multitask_loss(
                 outputs,
                 batch["final_target"],
                 batch["drop_target"],
@@ -402,6 +738,14 @@ def _run_temporal_epoch(
                 if scheduler is not None:
                     scheduler.step()
             losses.append(float(loss.detach().cpu()))
+            for name, value in loss_parts.items():
+                component_losses[name].append(value)
+            if batch_index == 1 or batch_index % 10 == 0 or batch_index == len(loader):
+                iterator.set_postfix(loss=f"{np.mean(losses):.4f}")
+            final_probability = torch.softmax(outputs["final_intensity"], dim=-1)
+            drop_probability = torch.softmax(outputs["drop_magnitude"], dim=-1)
+            final_probabilities.extend(final_probability.detach().cpu().tolist())
+            drop_probabilities.extend(drop_probability.detach().cpu().tolist())
             final_true.extend((batch["final_target"] + 1).detach().cpu().tolist())
             final_pred.extend(
                 (outputs["final_intensity"].argmax(dim=-1) + 1)
@@ -416,22 +760,42 @@ def _run_temporal_epoch(
                 .cpu()
                 .tolist()
             )
-    final_metrics = classification_metrics(final_true, final_pred)
-    final_metrics.update(ordinal_metrics(final_true, final_pred))
-    drop_metrics = classification_metrics(drop_true, drop_pred)
-    drop_metrics.update(ordinal_metrics(drop_true, drop_pred))
+    final_metrics = classification_metrics(final_true, final_pred, labels=(1, 2, 3, 4))
+    final_metrics.update(ordinal_metrics(final_true, final_pred, labels=(1, 2, 3, 4)))
+    drop_metrics = classification_metrics(drop_true, drop_pred, labels=(1, 2, 3, 4))
+    drop_metrics.update(ordinal_metrics(drop_true, drop_pred, labels=(1, 2, 3, 4)))
     metrics = {"loss": float(np.mean(losses))}
+    metrics.update(
+        {name: float(np.mean(values)) for name, values in component_losses.items()}
+    )
     metrics.update({f"final_{key}": value for key, value in final_metrics.items()})
     metrics.update({f"drop_{key}": value for key, value in drop_metrics.items()})
     predictions = pd.DataFrame(
         {
             "conversation_id": identifiers,
+            "initial_intensity": initial_values,
             "final_target": final_true,
             "final_prediction": final_pred,
             "drop_target": drop_true,
             "drop_prediction": drop_pred,
         }
     )
+    for index in range(4):
+        predictions[f"final_probability_{index + 1}"] = np.asarray(
+            final_probabilities
+        )[:, index]
+        predictions[f"drop_probability_{index + 1}"] = np.asarray(
+            drop_probabilities
+        )[:, index]
+    joint_metrics, joint_arrays = joint_prediction_diagnostics(
+        predictions["initial_intensity"],
+        predictions["final_prediction"],
+        predictions["drop_target"],
+        predictions["drop_prediction"],
+    )
+    metrics.update(joint_metrics)
+    for name, values in joint_arrays.items():
+        predictions[name] = values
     return metrics, predictions
 
 
@@ -443,7 +807,10 @@ def train_temporal_model(
     seed: int,
     config: dict[str, Any],
     transfer_checkpoint_path: str | Path | None = None,
+    use_initial_intensity: bool = False,
+    progress_position: int = 0,
 ) -> dict[str, Any]:
+    started_at = time.time()
     set_seed(seed)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -454,6 +821,16 @@ def train_temporal_model(
     train = subset[subset["split"] == "train"]
     validation = subset[subset["split"] == "validation"]
     test = subset[subset["split"] == "test"]
+    if use_initial_intensity and (
+        modality != "text_strategy" or transfer_checkpoint_path is None
+    ):
+        raise ValueError(
+            "Initial-aware ablation requires transferred text_strategy modality."
+        )
+    initial_mean = float(train["initial_intensity"].mean())
+    initial_std = float(train["initial_intensity"].std(ddof=0))
+    if use_initial_intensity and initial_std <= 0:
+        raise ValueError("Train initial intensity has zero variance.")
     transfer_checkpoint = None
     source_checkpoint_hash = None
     if transfer_checkpoint_path is not None:
@@ -473,6 +850,9 @@ def train_temporal_model(
         "strategy_mode": "quantity_timing_order",
         "max_length": config["max_length"],
         "max_chunks": config["max_chunks"],
+        "use_initial_intensity": use_initial_intensity,
+        "initial_intensity_mean": initial_mean if use_initial_intensity else None,
+        "initial_intensity_std": initial_std if use_initial_intensity else None,
     }
     train_dataset = TemporalDataset(train, **dataset_arguments)
     validation_dataset = TemporalDataset(validation, **dataset_arguments)
@@ -517,6 +897,7 @@ def train_temporal_model(
         strategy_hidden_size=config["strategy_hidden_size"],
         dropout=config["dropout"],
         max_chunks=config["max_chunks"],
+        use_initial_intensity=use_initial_intensity,
     ).to(device)
     run_config = {
         "run_type": "temporal",
@@ -524,6 +905,12 @@ def train_temporal_model(
         "modality": modality,
         "transfer": transfer_checkpoint is not None,
         "seed": seed,
+        "use_initial_intensity": use_initial_intensity,
+        "initial_intensity_standardization": (
+            {"mean": initial_mean, "std": initial_std, "source": "train_only"}
+            if use_initial_intensity
+            else None
+        ),
         "checkpoints_path": str(Path(checkpoints_path).resolve()),
         "checkpoints_sha256": _file_hash(checkpoints_path),
         "split_hash": _split_hash(subset),
@@ -533,16 +920,28 @@ def train_temporal_model(
             else None
         ),
         "source_checkpoint_sha256": source_checkpoint_hash,
+        "environment": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "cuda_available": torch.cuda.is_available(),
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        },
         "config": config,
     }
-    with (output / "run_config.json").open("w", encoding="utf-8") as handle:
-        json.dump(run_config, handle, indent=2, sort_keys=True)
     final_weights = _class_weights(
         train["final_intensity"], (1, 2, 3, 4), device
     )
     drop_weights = _class_weights(
         train["drop_magnitude"], (1, 2, 3, 4), device
     )
+    run_config["class_weights"] = {
+        "final_intensity": final_weights.detach().cpu().tolist(),
+        "drop_magnitude": drop_weights.detach().cpu().tolist(),
+    }
+    with (output / "run_config.json").open("w", encoding="utf-8") as handle:
+        json.dump(run_config, handle, indent=2, sort_keys=True)
     optimizer = AdamW(
         model.parameters(),
         lr=config["learning_rate"],
@@ -557,8 +956,33 @@ def train_temporal_model(
     best_score = -float("inf")
     best_epoch = 0
     model_path = output / "best_model.pt"
+    progress_path = output / "training_progress.jsonl"
+    _append_progress(
+        progress_path,
+        {
+            "event": "run_started",
+            "checkpoint": checkpoint,
+            "modality": modality,
+            "transfer": transfer_checkpoint is not None,
+            "use_initial_intensity": use_initial_intensity,
+            "seed": seed,
+        },
+    )
     history: list[dict[str, Any]] = []
-    for epoch in range(1, config["epochs"] + 1):
+    run_label = (
+        f"Target {int(round(checkpoint * 100))}% {modality} seed {seed}"
+        + (" +initial" if use_initial_intensity else "")
+    )
+    epoch_iterator = tqdm(
+        range(1, config["epochs"] + 1),
+        desc=run_label,
+        unit="epoch",
+        position=progress_position,
+        leave=True,
+        dynamic_ncols=True,
+    )
+    for epoch in epoch_iterator:
+        epoch_started = time.time()
         train_metrics, _ = _run_temporal_epoch(
             model,
             loaders["train"],
@@ -567,6 +991,8 @@ def train_temporal_model(
             drop_weights,
             optimizer,
             scheduler,
+            progress_description=f"epoch {epoch} train",
+            progress_position=progress_position + 1,
         )
         validation_metrics, _ = _run_temporal_epoch(
             model,
@@ -574,6 +1000,8 @@ def train_temporal_model(
             device,
             final_weights,
             drop_weights,
+            progress_description=f"epoch {epoch} validation",
+            progress_position=progress_position + 1,
         )
         score = (
             validation_metrics["final_f1_macro"]
@@ -585,12 +1013,27 @@ def train_temporal_model(
                 "train": train_metrics,
                 "validation": validation_metrics,
                 "selection_score": score,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "duration_seconds": time.time() - epoch_started,
             }
+        )
+        _append_progress(
+            progress_path,
+            {"event": "epoch_completed", **history[-1]},
         )
         if score > best_score:
             best_score = score
             best_epoch = epoch
             torch.save(model.state_dict(), model_path)
+            tqdm.write(
+                f"[{run_label}] saved best checkpoint at epoch {best_epoch} "
+                f"(selection macro-F1={best_score:.4f})"
+            )
+        epoch_iterator.set_postfix(
+            val_f1=f"{score:.4f}",
+            val_loss=f"{validation_metrics['loss']:.4f}",
+            best_epoch=best_epoch or "-",
+        )
         if epoch - best_epoch >= config["early_stopping_patience"]:
             break
     model.load_state_dict(
@@ -604,14 +1047,41 @@ def train_temporal_model(
             device,
             final_weights,
             drop_weights,
+            progress_description=f"{run_label} final {split_name}",
+            progress_position=progress_position + 1,
         )
         predictions["split"] = split_name
         predictions["checkpoint"] = checkpoint
         predictions["checkpoint_percent"] = int(round(checkpoint * 100))
         predictions["modality"] = modality
         predictions["transfer"] = transfer_checkpoint is not None
+        predictions["use_initial_intensity"] = use_initial_intensity
         predictions["seed"] = seed
         predictions.to_csv(output / f"{split_name}_predictions.csv", index=False)
+        diagnostic_rows: list[dict[str, Any]] = []
+        confusion_rows: list[dict[str, Any]] = []
+        for target, truth, predicted in (
+            ("final_intensity", predictions["final_target"], predictions["final_prediction"]),
+            ("drop_magnitude", predictions["drop_target"], predictions["drop_prediction"]),
+        ):
+            diagnostic_rows.extend(
+                {"target": target, **row}
+                for row in per_class_metrics(
+                    truth, predicted, labels=(1, 2, 3, 4), label_names=("1", "2", "3", "4")
+                )
+            )
+            confusion_rows.extend(
+                {"target": target, **row}
+                for row in confusion_matrix_records(
+                    truth, predicted, labels=(1, 2, 3, 4)
+                )
+            )
+        pd.DataFrame(diagnostic_rows).to_csv(
+            output / f"{split_name}_per_class_metrics.csv", index=False
+        )
+        pd.DataFrame(confusion_rows).to_csv(
+            output / f"{split_name}_confusion_matrices.csv", index=False
+        )
         for target, prefix in (
             ("final_intensity", "final"),
             ("drop_magnitude", "drop"),
@@ -624,12 +1094,19 @@ def train_temporal_model(
                     "target": target,
                     "modality": modality,
                     "transfer": transfer_checkpoint is not None,
+                    "use_initial_intensity": use_initial_intensity,
                     "seed": seed,
                     **{
                         key.removeprefix(f"{prefix}_"): value
                         for key, value in metrics.items()
                         if key.startswith(f"{prefix}_")
                     },
+                    "joint_consistency_rate": metrics["joint_consistency_rate"],
+                    "derived_drop_accuracy": metrics["derived_drop_accuracy"],
+                    "derived_drop_mae": metrics["derived_drop_mae"],
+                    "invalid_derived_drop_rate": metrics[
+                        "invalid_derived_drop_rate"
+                    ],
                 }
             )
     metrics_frame = pd.DataFrame(metric_rows)
@@ -641,6 +1118,12 @@ def train_temporal_model(
         "modality": modality,
         "transfer": transfer_checkpoint is not None,
         "seed": seed,
+        "use_initial_intensity": use_initial_intensity,
+        "initial_intensity_standardization": (
+            {"mean": initial_mean, "std": initial_std, "source": "train_only"}
+            if use_initial_intensity
+            else None
+        ),
         "best_epoch": best_epoch,
         "best_selection_score": best_score,
         "split_hash": _split_hash(subset),
@@ -651,7 +1134,9 @@ def train_temporal_model(
         ),
         "source_checkpoint_sha256": source_checkpoint_hash,
         "device": str(device),
+        "duration_seconds": time.time() - started_at,
     }
     with (output / "run_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+    _append_progress(progress_path, {"event": "run_completed", **summary})
     return summary

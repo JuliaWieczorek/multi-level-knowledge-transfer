@@ -46,6 +46,10 @@
     "dropout": 0.4,
     "warmup_ratio": 0.2,
     "focal_gamma": 2.0,
+    "emotion_threshold": 0.4,
+    "exclude_invalid_generations": true,
+    "drop_exact_train_duplicates": true,
+    "drop_conflicting_train_texts": true,
     "soft_sharing_lambda": 0.0001,
     "task_weights": {
       "sentiment": 1.0,

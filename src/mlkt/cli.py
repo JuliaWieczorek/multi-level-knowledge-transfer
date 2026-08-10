@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pandas as pd
 
-from .baseline import run_naive_baselines, run_tfidf_baseline
 from .data import (
     assert_checkpoint_integrity,
     build_esconv_checkpoints,
@@ -98,6 +97,12 @@ def describe(args: argparse.Namespace) -> None:
 
 
 def baseline(args: argparse.Namespace) -> None:
+    from .baseline import (
+        run_initial_only_baseline,
+        run_naive_baselines,
+        run_tfidf_baseline,
+    )
+
     input_path = Path(
         args.input
         or PROJECT_ROOT
@@ -108,6 +113,10 @@ def baseline(args: argparse.Namespace) -> None:
     frame = pd.read_csv(input_path)
     if args.model == "naive":
         metrics, predictions = run_naive_baselines(frame, task=args.task)
+    elif args.model == "initial":
+        metrics, predictions = run_initial_only_baseline(
+            frame, task=args.task, seed=args.seed
+        )
     else:
         metrics, predictions = run_tfidf_baseline(
             frame, task=args.task, text_column=args.text_column, seed=args.seed
@@ -204,6 +213,7 @@ def augment_transfer(args: argparse.Namespace) -> None:
 
 def pretrain_transfer(args: argparse.Namespace) -> None:
     from .training import pretrain_source_mtl
+    from tqdm.auto import tqdm
 
     config_path = Path(args.config).resolve()
     config = _load_config(config_path)
@@ -221,16 +231,64 @@ def pretrain_transfer(args: argparse.Namespace) -> None:
     )
     seeds = [args.seed] if args.seed is not None else config["seeds"]
     summaries = []
-    for seed in seeds:
+    seed_iterator = tqdm(
+        seeds,
+        desc="Source MTL seeds",
+        unit="seed",
+        position=0,
+        leave=True,
+        dynamic_ncols=True,
+    )
+    for seed in seed_iterator:
+        seed_iterator.set_postfix(seed=seed)
         summaries.append(
             pretrain_source_mtl(
                 source_path=source_path,
                 output_dir=output_root / f"seed_{seed}",
                 seed=seed,
                 config=source_config,
+                progress_position=1,
             )
         )
     print(json.dumps(summaries, indent=2))
+
+
+def preflight_source(args: argparse.Namespace) -> None:
+    from .validation import (
+        validate_augmentation_artifacts,
+        validate_source_training_frame,
+    )
+
+    config_path = Path(args.config).resolve()
+    config = _load_config(config_path)
+    source_path = Path(args.input) if args.input else (
+        _config_output_path(config["transfer"]["augmented_dir"], config_path)
+        / "meisd_target_style_onehot.csv"
+    )
+    frame = pd.read_csv(source_path)
+    augmentation_report = validate_augmentation_artifacts(source_path, frame)
+    emotion_names = sorted(
+        column.split("emotion__", 1)[1]
+        for column in frame.columns
+        if column.startswith("emotion__")
+    )
+    _, report = validate_source_training_frame(
+        frame,
+        emotion_names,
+        exclude_invalid_generations=config["source_mtl"].get(
+            "exclude_invalid_generations", True
+        ),
+        drop_exact_train_duplicates=config["source_mtl"].get(
+            "drop_exact_train_duplicates", True
+        ),
+        drop_conflicting_train_texts=config["source_mtl"].get(
+            "drop_conflicting_train_texts", True
+        ),
+    )
+    report["source_path"] = str(source_path.resolve())
+    report["emotion_names"] = emotion_names
+    report["augmentation_artifacts"] = augmentation_report
+    print(json.dumps(report, indent=2, sort_keys=True))
 
 
 def train_temporal(args: argparse.Namespace) -> None:
@@ -264,6 +322,7 @@ def train_temporal(args: argparse.Namespace) -> None:
         seed=args.seed,
         config=temporal,
         transfer_checkpoint_path=transfer_checkpoint,
+        use_initial_intensity=args.use_initial_intensity,
     )
     print(json.dumps(summary, indent=2))
 
@@ -370,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     baseline_parser.add_argument(
-        "--model", choices=("naive", "tfidf"), default="naive"
+        "--model", choices=("naive", "tfidf", "initial"), default="naive"
     )
     baseline_parser.add_argument("--text-column", default="text")
     baseline_parser.add_argument("--input")
@@ -406,6 +465,11 @@ def build_parser() -> argparse.ArgumentParser:
     source_parser.add_argument("--seed", type=int)
     source_parser.set_defaults(function=pretrain_transfer)
 
+    source_preflight_parser = subparsers.add_parser("preflight-source")
+    source_preflight_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    source_preflight_parser.add_argument("--input")
+    source_preflight_parser.set_defaults(function=preflight_source)
+
     temporal_parser = subparsers.add_parser("train-temporal")
     temporal_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     temporal_parser.add_argument("--input")
@@ -424,6 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
     transfer_group.add_argument("--transfer", action="store_true")
     transfer_group.add_argument("--vanilla", action="store_true")
     temporal_parser.add_argument("--source-checkpoint")
+    temporal_parser.add_argument("--use-initial-intensity", action="store_true")
     temporal_parser.set_defaults(function=train_temporal)
 
     matrix_parser = subparsers.add_parser("run-matrix")

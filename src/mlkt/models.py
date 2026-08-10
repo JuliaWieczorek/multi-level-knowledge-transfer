@@ -256,11 +256,15 @@ class TemporalMultiModalModel(nn.Module):
         strategy_hidden_size: int = 256,
         dropout: float = 0.4,
         max_chunks: int = 32,
+        use_initial_intensity: bool = False,
     ) -> None:
         super().__init__()
         if modality not in self.MODALITIES:
             raise ValueError(f"Unsupported modality: {modality}")
         self.modality = modality
+        self.use_initial_intensity = use_initial_intensity
+        if use_initial_intensity and modality != "text_strategy":
+            raise ValueError("Initial intensity is supported only for text_strategy.")
         self.text_encoder: AffectiveTextEncoder | None = None
         self.strategy_encoder: StrategyEncoder | None = None
         if "text" in modality:
@@ -289,8 +293,9 @@ class TemporalMultiModalModel(nn.Module):
                 nn.Sigmoid(),
             )
             output_size = self.text_encoder.hidden_size
+        shared_input_size = output_size + (1 if use_initial_intensity else 0)
         self.shared = nn.Sequential(
-            nn.Linear(output_size, output_size // 2),
+            nn.Linear(shared_input_size, output_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
@@ -326,6 +331,10 @@ class TemporalMultiModalModel(nn.Module):
                 torch.cat([text, projected_strategy], dim=-1)
             )
             representation = gate * text + (1.0 - gate) * projected_strategy
+        if self.use_initial_intensity:
+            if "initial_feature" not in batch:
+                raise ValueError("Initial-aware model requires initial_feature.")
+            representation = torch.cat([representation, batch["initial_feature"]], dim=-1)
         shared = self.shared(representation)
         return {
             "final_intensity": self.final_head(shared),

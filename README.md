@@ -28,6 +28,7 @@ The main ablation is intentionally asymmetric:
 | transferred text-only | yes | no | yes |
 | strategy-only | no | yes | not applicable |
 | transferred text+strategy | yes | yes | yes |
+| transferred text+strategy+initial | yes | yes | yes |
 | vanilla text-only control | yes | no | no |
 | vanilla text+strategy control | yes | yes | no |
 
@@ -68,8 +69,10 @@ conditional intensity `0.7` with cross-entropy.
   magnitude.
 
 All neural runs are repeated for seeds `42, 52, 62, 72, 82`. Macro-F1 is the
-primary metric; accuracy, weighted-F1, MAE, quadratic weighted kappa, confusion
-matrices, standard deviation, and 95% confidence intervals are also reported.
+primary metric; accuracy, precision, recall, micro/weighted-F1, MAE, quadratic
+weighted kappa, confusion matrices, standard deviation, and 95% confidence
+intervals are also reported. Source MTL additionally records proper multilabel
+emotion metrics, per-emotion diagnostics, probabilities, and per-class results.
 
 ## Strategy analysis
 
@@ -140,9 +143,10 @@ python -m mlkt.cli augment-transfer --mock-generator `
   --output-dir data\processed\transfer\smoke_augmented
 
 # 4. Train five shared source checkpoints.
+python -m mlkt.cli preflight-source
 python -m mlkt.cli pretrain-transfer
 
-# 5. Inspect the complete 125-run target matrix without training.
+# 5. Inspect the complete 150-run target matrix without training.
 python -m mlkt.cli run-matrix --dry-run
 
 # 6. Run/resume all target experiments on CUDA.
@@ -158,6 +162,12 @@ python -m mlkt.cli report
 Full augmentation appends every result to `augmentation_progress.jsonl`.
 Repeating the same command with `--resume` continues from that file. Final CSV
 and manifest files are replaced atomically only after the plan is complete.
+
+Neural training displays nested progress bars for seeds/runs, epochs, and batches,
+including ETA, current loss, validation metrics, and the best epoch. Durable progress
+events are appended to `source_training_progress.jsonl` for source pretraining,
+`training_progress.jsonl` for each target run, and `matrix_progress.jsonl` for the
+complete target matrix.
 
 Single-run example:
 
@@ -176,6 +186,8 @@ Baseline and validation commands:
 python -m mlkt.cli describe
 python -m mlkt.cli baseline --dataset esconv --task final_intensity
 python -m mlkt.cli baseline --dataset esconv --task drop_magnitude
+python -m mlkt.cli baseline --dataset esconv --task final_intensity --model initial
+python -m mlkt.cli baseline --dataset esconv --task drop_magnitude --model initial
 python -m unittest discover -s tests -v
 ```
 
@@ -185,6 +197,7 @@ python -m unittest discover -s tests -v
 - ESConv validation/test rows never inform target-style pattern extraction.
 - MEISD start/end segments remain in one source split.
 - Only source training rows are augmented.
+- Failed augmentation generations are excluded from source training by default.
 - Test curves are never used for tuning or early stopping.
 - Every run records its split hash, source checkpoint, seed, configuration,
   predictions, history, and metrics.

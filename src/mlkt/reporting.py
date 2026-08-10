@@ -14,7 +14,11 @@ def collect_metric_files(root: str | Path) -> pd.DataFrame:
     frames = [pd.read_csv(path).assign(metrics_file=str(path)) for path in files]
     if not frames:
         raise ValueError(f"No metrics.csv files found below {root}.")
-    return pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True)
+    if "use_initial_intensity" not in combined:
+        combined["use_initial_intensity"] = False
+    combined["use_initial_intensity"] = combined["use_initial_intensity"].fillna(False)
+    return combined
 
 
 def _ci95(values: pd.Series) -> float:
@@ -25,6 +29,8 @@ def _ci95(values: pd.Series) -> float:
 
 
 def aggregate_seed_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
+    if "use_initial_intensity" not in metrics:
+        metrics = metrics.assign(use_initial_intensity=False)
     identifiers = [
         "checkpoint",
         "checkpoint_percent",
@@ -32,6 +38,7 @@ def aggregate_seed_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
         "target",
         "modality",
         "transfer",
+        "use_initial_intensity",
     ]
     metric_columns = [
         column
@@ -41,6 +48,13 @@ def aggregate_seed_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
             "f1_weighted",
             "mae",
             "quadratic_weighted_kappa",
+            "precision_macro",
+            "recall_macro",
+            "f1_micro",
+            "joint_consistency_rate",
+            "derived_drop_accuracy",
+            "derived_drop_mae",
+            "invalid_derived_drop_rate",
         )
         if column in metrics
     ]
@@ -57,7 +71,12 @@ def aggregate_seed_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
 
 
 def paired_transfer_deltas(metrics: pd.DataFrame) -> pd.DataFrame:
-    text_models = metrics[metrics["modality"].isin(["text", "text_strategy"])]
+    if "use_initial_intensity" not in metrics:
+        metrics = metrics.assign(use_initial_intensity=False)
+    text_models = metrics[
+        metrics["modality"].isin(["text", "text_strategy"])
+        & ~metrics["use_initial_intensity"].fillna(False)
+    ]
     index = [
         "checkpoint",
         "checkpoint_percent",
@@ -65,6 +84,7 @@ def paired_transfer_deltas(metrics: pd.DataFrame) -> pd.DataFrame:
         "target",
         "modality",
         "seed",
+        "use_initial_intensity",
     ]
     pivot = text_models.pivot_table(
         index=index,
@@ -107,14 +127,18 @@ def _plot_curves(summary: pd.DataFrame, output_dir: Path) -> list[str]:
     for target in test["target"].unique():
         subset = test[test["target"] == target]
         figure, axis = plt.subplots(figsize=(7, 4.5))
-        for (modality, transfer), group in subset.groupby(
-            ["modality", "transfer"], sort=True
+        for (modality, transfer, initial), group in subset.groupby(
+            ["modality", "transfer", "use_initial_intensity"], sort=True
         ):
             group = group.sort_values("checkpoint_percent")
             label = (
                 "strategy-only"
                 if modality == "strategy"
-                else f"{modality} ({'transfer' if transfer else 'vanilla'})"
+                else (
+                    f"{modality} (transfer + initial)"
+                    if initial
+                    else f"{modality} ({'transfer' if transfer else 'vanilla'})"
+                )
             )
             axis.errorbar(
                 group["checkpoint_percent"],
@@ -148,16 +172,21 @@ def _build_confusion_tables(
         [pd.read_csv(path).assign(predictions_file=str(path)) for path in files],
         ignore_index=True,
     )
+    if "use_initial_intensity" not in predictions:
+        predictions["use_initial_intensity"] = False
     confusion_dir = output_dir / "confusion_matrices"
     confusion_dir.mkdir(parents=True, exist_ok=True)
     created: list[str] = []
     for keys, group in predictions.groupby(
-        ["checkpoint_percent", "modality", "transfer"], sort=True
+        ["checkpoint_percent", "modality", "transfer", "use_initial_intensity"],
+        sort=True,
     ):
-        checkpoint, modality, transfer = keys
+        checkpoint, modality, transfer, initial = keys
         variant = "transfer" if transfer else "vanilla"
         if modality == "strategy":
             variant = "strategy"
+        elif initial:
+            variant = "transfer_initial"
         for target, prediction in (
             ("final", "final_prediction"),
             ("drop", "drop_prediction"),
@@ -191,7 +220,14 @@ def build_report(
     manifest = {
         "runs": int(
             metrics[
-                ["checkpoint", "modality", "transfer", "seed", "metrics_file"]
+                [
+                    "checkpoint",
+                    "modality",
+                    "transfer",
+                    "use_initial_intensity",
+                    "seed",
+                    "metrics_file",
+                ]
             ].drop_duplicates().shape[0]
         ),
         "seeds": sorted(int(seed) for seed in metrics["seed"].unique()),
