@@ -28,6 +28,10 @@
       "generator": "llama-2-7b-chat-gguf",
       "context_size": 2048,
       "threads": 8,
+      "gpu_layers": -1,
+      "batch_size": 1024,
+      "checkpoint_every": 25,
+      "max_tokens": 150,
       "min_compatible_samples": 5,
       "max_aug_per_group": 600
     }

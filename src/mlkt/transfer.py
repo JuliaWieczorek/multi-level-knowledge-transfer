@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import random
 import re
-from collections import Counter, defaultdict
+import time
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 import pandas as pd
 
@@ -494,20 +497,98 @@ class LlamaCppGenerator:
         model_path: str | Path,
         context_size: int = 2048,
         threads: int = 8,
+        gpu_layers: int = -1,
+        batch_size: int = 1024,
+        require_gpu: bool = False,
     ) -> None:
         try:
+            import llama_cpp
             from llama_cpp import Llama
         except ImportError as error:
             raise RuntimeError(
                 "Llama generation requires llama-cpp-python. "
                 "Install the 'augmentation' optional dependency."
             ) from error
+        model_path = Path(model_path).resolve()
+        if not model_path.is_file():
+            raise ValueError(f"Model path does not exist: {model_path}")
+        system_info = llama_cpp.llama_print_system_info().decode(
+            errors="replace"
+        )
+        upper_info = system_info.upper()
+        native_library_dir = Path(llama_cpp.__file__).resolve().parent / "lib"
+        native_libraries = (
+            {path.name.lower() for path in native_library_dir.iterdir()}
+            if native_library_dir.is_dir()
+            else set()
+        )
+        if "VULKAN" in upper_info or any(
+            "vulkan" in name for name in native_libraries
+        ):
+            backend = "vulkan"
+        elif (
+            "ROCM" in upper_info
+            or "HIP" in upper_info
+            or any("hip" in name for name in native_libraries)
+        ):
+            backend = "rocm"
+        elif "CUDA" in upper_info or any(
+            "cuda" in name for name in native_libraries
+        ):
+            backend = "cuda"
+        else:
+            backend = "cpu"
+        supports_offload = bool(llama_cpp.llama_supports_gpu_offload())
+        if require_gpu and (backend == "cpu" or not supports_offload):
+            raise RuntimeError(
+                "GPU generation was required, but llama-cpp-python has no "
+                "GPU-offload backend. Install the Vulkan wheel and retry. "
+                f"System info: {system_info}"
+            )
+        if require_gpu and gpu_layers == 0:
+            raise ValueError("--require-gpu cannot be combined with --gpu-layers 0.")
+        print(
+            "llama.cpp backend: "
+            f"{backend}; GPU offload: {supports_offload}; "
+            f"requested GPU layers: {gpu_layers}"
+        )
         self._model = Llama(
             model_path=str(model_path),
             n_ctx=context_size,
             n_threads=threads,
+            n_threads_batch=threads,
+            n_gpu_layers=gpu_layers,
+            n_batch=batch_size,
+            n_ubatch=min(batch_size, 512),
+            flash_attn=True,
+            offload_kqv=True,
             verbose=False,
         )
+        model_layers = int(llama_cpp.llama_model_n_layer(self._model.model))
+        gpu_layers_effective = (
+            model_layers if gpu_layers < 0 else min(gpu_layers, model_layers)
+        )
+        if require_gpu and gpu_layers_effective < model_layers:
+            raise RuntimeError(
+                "Full GPU offload was required, but fewer than all model "
+                f"layers were requested ({gpu_layers_effective}/{model_layers})."
+            )
+        self._metadata = {
+            "backend": backend,
+            "gpu_offload_supported": supports_offload,
+            "gpu_layers_requested": gpu_layers,
+            "model_layers": model_layers,
+            "gpu_layers_effective": gpu_layers_effective,
+            "batch_size": batch_size,
+            "context_size": context_size,
+            "threads": threads,
+            "model_path": str(model_path),
+            "system_info": system_info,
+            "native_libraries": sorted(native_libraries),
+        }
+
+    def metadata(self) -> dict[str, Any]:
+        return dict(self._metadata)
 
     def generate(self, prompt: str, max_tokens: int, seed: int) -> str:
         output = self._model(
@@ -525,6 +606,9 @@ class DeterministicMockGenerator:
     """Non-semantic generator used only by tests and pipeline smoke checks."""
 
     name = "deterministic-mock"
+
+    def metadata(self) -> dict[str, Any]:
+        return {"backend": "mock", "gpu_offload_supported": False}
 
     def generate(self, prompt: str, max_tokens: int, seed: int) -> str:
         match = re.search(r'Original: "(.*?)"', prompt, flags=re.DOTALL)
@@ -602,15 +686,14 @@ def _quality_score(
     return round(0.45 * length_score + 0.35 * keyword_score + 0.20 * changed, 6)
 
 
-def augment_source_training(
+def build_augmentation_plan(
     prepared_meisd: pd.DataFrame,
     patterns: dict[str, Any],
-    generator: TextGenerator,
     seed: int = 42,
     min_compatible_samples: int = 5,
     max_aug_per_group: int = 600,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Balance source train bundles; never augment source validation."""
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict[str, Any]], dict[str, Any]]:
+    """Create the deterministic source-row and seed plan before generation."""
     filtered, filter_report = filter_meisd_for_esconv(
         prepared_meisd,
         patterns,
@@ -629,8 +712,7 @@ def augment_source_training(
         raise ValueError("No compatible MEISD training rows remain after filtering.")
     target_count = int(group_counts.max())
     rng = random.Random(seed)
-    generated_rows: list[dict[str, Any]] = []
-    invalid_generations = 0
+    plan: list[dict[str, Any]] = []
     generation_index = 0
     for key, count in group_counts.items():
         needed = min(target_count - int(count), max_aug_per_group)
@@ -639,15 +721,181 @@ def augment_source_training(
         group = train[train["emotion_bundle_key"] == key]
         source_indices = group.index.tolist()
         for _ in range(needed):
-            source_index = rng.choice(source_indices)
+            source_index = int(rng.choice(source_indices))
             source = train.loc[source_index]
+            plan.append(
+                {
+                    "generation_index": generation_index,
+                    "generation_seed": seed + generation_index,
+                    "emotion_bundle_key": key,
+                    "source_index": source_index,
+                    "source_conversation_id": str(source["conversation_id"]),
+                    "source_text_sha256": hashlib.sha256(
+                        str(source["Utterances"]).encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+            generation_index += 1
+
+    report = {
+        **filter_report,
+        "seed": seed,
+        "original_train_rows": len(train),
+        "planned_generation_rows": len(plan),
+        "validation_rows": len(validation),
+        "min_compatible_samples": min_compatible_samples,
+        "max_aug_per_group": max_aug_per_group,
+        "target_group_count": target_count,
+        "style_split_hash": patterns["metadata"]["split_hash"],
+    }
+    return train, validation, plan, report
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(_json_safe(payload), handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def _atomic_csv(path: Path, frame: pd.DataFrame) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    frame.to_csv(temporary, index=False)
+    temporary.replace(path)
+
+
+def _plan_signature(plan: Sequence[dict[str, Any]], report: dict[str, Any]) -> str:
+    identity = {
+        "plan": list(plan),
+        "seed": report["seed"],
+        "style_split_hash": report["style_split_hash"],
+        "max_aug_per_group": report["max_aug_per_group"],
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _read_progress(
+    path: Path, plan_signature: str
+) -> dict[int, dict[str, Any]]:
+    completed: dict[int, dict[str, Any]] = {}
+    if not path.exists():
+        return completed
+    valid_lines: list[str] = []
+    truncated_final_line = False
+    with path.open(encoding="utf-8") as handle:
+        lines = handle.readlines()
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # A process can be killed in the middle of the final append.
+                if line_number == len(lines):
+                    truncated_final_line = True
+                    break
+                raise
+            if record.get("plan_signature") != plan_signature:
+                raise RuntimeError(
+                    "Existing augmentation progress belongs to a different plan. "
+                    "Use another output directory or remove the progress file."
+                )
+            index = int(record["generation_index"])
+            if index in completed:
+                raise RuntimeError(f"Duplicate generation index in progress: {index}")
+            completed[index] = record["row"]
+            valid_lines.append(line)
+    if truncated_final_line:
+        with path.open("w", encoding="utf-8") as handle:
+            handle.writelines(valid_lines)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return completed
+
+
+def _generator_metadata(generator: TextGenerator) -> dict[str, Any]:
+    metadata = getattr(generator, "metadata", None)
+    return dict(metadata()) if callable(metadata) else {}
+
+
+def _execute_augmentation_plan(
+    train: pd.DataFrame,
+    patterns: dict[str, Any],
+    generator: TextGenerator,
+    plan: Sequence[dict[str, Any]],
+    plan_signature: str,
+    progress_path: Path | None = None,
+    checkpoint_every: int = 25,
+    resume: bool = False,
+    max_tokens: int = 150,
+) -> tuple[list[dict[str, Any]], int, int]:
+    if checkpoint_every < 1:
+        raise ValueError("checkpoint_every must be at least 1")
+    completed: dict[int, dict[str, Any]] = {}
+    resume_count = 0
+    if progress_path is not None and progress_path.exists():
+        if not resume:
+            raise RuntimeError(
+                f"Progress file already exists: {progress_path}. "
+                "Pass --resume or use another output directory."
+            )
+        completed = _read_progress(progress_path, plan_signature)
+        resume_count = 1 if completed else 0
+    invalid_generations = sum(
+        not bool(row.get("generation_valid")) for row in completed.values()
+    )
+    pending = [item for item in plan if item["generation_index"] not in completed]
+
+    try:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            pending,
+            total=len(plan),
+            initial=len(completed),
+            unit="generation",
+            desc="Augmenting MEISD",
+        )
+    except ImportError:
+        iterator = pending
+
+    progress_handle = None
+    try:
+        if progress_path is not None:
+            progress_path.parent.mkdir(parents=True, exist_ok=True)
+            progress_handle = progress_path.open("a", encoding="utf-8")
+        since_flush = 0
+        started = time.perf_counter()
+        for item in iterator:
+            source = train.loc[item["source_index"]]
             bundle = emotion_bundle(source)
             style = _merge_bundle_patterns(patterns, bundle, source["sentiment"])
             prompt = _augmentation_prompt(
                 source["Utterances"], bundle, source["sentiment"], style
             )
-            generation_seed = seed + generation_index
-            raw = generator.generate(prompt, max_tokens=150, seed=generation_seed)
+            raw = generator.generate(
+                prompt,
+                max_tokens=max_tokens,
+                seed=item["generation_seed"],
+            )
             valid, cleaned = validate_generated_text(raw)
             if not valid:
                 invalid_generations += 1
@@ -660,13 +908,83 @@ def augment_source_training(
                     "source_conversation_id": source["conversation_id"],
                     "augmented": True,
                     "generation_valid": valid,
-                    "generation_seed": generation_seed,
+                    "generation_seed": item["generation_seed"],
                     "generator": generator.name,
                     "quality": _quality_score(source["Utterances"], cleaned, style),
                 }
             )
-            generated_rows.append(row)
-            generation_index += 1
+            safe_row = _json_safe(row)
+            completed[item["generation_index"]] = safe_row
+            if progress_handle is not None:
+                record = {
+                    "plan_signature": plan_signature,
+                    "generation_index": item["generation_index"],
+                    "row": safe_row,
+                }
+                progress_handle.write(
+                    json.dumps(record, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                )
+                since_flush += 1
+                if since_flush >= checkpoint_every:
+                    progress_handle.flush()
+                    os.fsync(progress_handle.fileno())
+                    since_flush = 0
+            if hasattr(iterator, "set_postfix"):
+                elapsed = max(time.perf_counter() - started, 1e-9)
+                new_count = len(completed) - (len(plan) - len(pending))
+                iterator.set_postfix(
+                    invalid=invalid_generations,
+                    rate=f"{new_count / elapsed:.2f}/s",
+                )
+    finally:
+        if progress_handle is not None:
+            progress_handle.flush()
+            os.fsync(progress_handle.fileno())
+            progress_handle.close()
+
+    if len(completed) != len(plan):
+        raise RuntimeError(
+            f"Augmentation incomplete: {len(completed)} of {len(plan)} rows."
+        )
+    generated_rows = [
+        completed[int(item["generation_index"])] for item in plan
+    ]
+    return generated_rows, invalid_generations, resume_count
+
+
+def augment_source_training(
+    prepared_meisd: pd.DataFrame,
+    patterns: dict[str, Any],
+    generator: TextGenerator,
+    seed: int = 42,
+    min_compatible_samples: int = 5,
+    max_aug_per_group: int = 600,
+    progress_path: str | Path | None = None,
+    checkpoint_every: int = 25,
+    resume: bool = False,
+    max_tokens: int = 150,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Balance source train bundles; never augment source validation."""
+    train, validation, plan, report = build_augmentation_plan(
+        prepared_meisd,
+        patterns,
+        seed=seed,
+        min_compatible_samples=min_compatible_samples,
+        max_aug_per_group=max_aug_per_group,
+    )
+    signature = _plan_signature(plan, report)
+    generated_rows, invalid_generations, resume_count = _execute_augmentation_plan(
+        train,
+        patterns,
+        generator,
+        plan,
+        signature,
+        progress_path=Path(progress_path) if progress_path is not None else None,
+        checkpoint_every=checkpoint_every,
+        resume=resume,
+        max_tokens=max_tokens,
+    )
 
     original_train = train.drop(columns=["emotion_bundle_key"]).copy()
     original_train["original"] = original_train["Utterances"]
@@ -692,16 +1010,14 @@ def augment_source_training(
     if output.loc[output["split"] == "validation", "augmented"].any():
         raise AssertionError("Validation augmentation leakage detected.")
     report = {
-        **filter_report,
+        **report,
         "generator": generator.name,
-        "seed": seed,
-        "original_train_rows": len(original_train),
         "generated_train_rows": len(generated_rows),
-        "validation_rows": len(validation),
         "invalid_generations": invalid_generations,
-        "min_compatible_samples": min_compatible_samples,
-        "max_aug_per_group": max_aug_per_group,
-        "style_split_hash": patterns["metadata"]["split_hash"],
+        "resume_count": resume_count,
+        "plan_signature": signature,
+        "max_tokens": max_tokens,
+        "generator_metadata": _generator_metadata(generator),
     }
     return output, report
 
@@ -746,13 +1062,98 @@ def run_augmentation_pipeline(
     seed: int = 42,
     min_compatible_samples: int = 5,
     max_aug_per_group: int = 600,
+    checkpoint_every: int = 25,
+    resume: bool = False,
+    max_tokens: int = 150,
+    benchmark: int | None = None,
 ) -> dict[str, Any]:
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     esconv = pd.read_csv(prepared_esconv_path)
     meisd = pd.read_csv(prepared_meisd_path)
     patterns = extract_style_patterns(esconv)
-    save_style_patterns(patterns, output / "esconv_train_style_patterns.json")
+    train, _, plan, plan_report = build_augmentation_plan(
+        meisd,
+        patterns,
+        seed=seed,
+        min_compatible_samples=min_compatible_samples,
+        max_aug_per_group=max_aug_per_group,
+    )
+    signature = _plan_signature(plan, plan_report)
+    if benchmark is not None:
+        if benchmark < 1:
+            raise ValueError("benchmark must be at least 1")
+        sample_size = min(benchmark, len(plan))
+        positions = (
+            [0]
+            if sample_size == 1
+            else [
+                round(index * (len(plan) - 1) / (sample_size - 1))
+                for index in range(sample_size)
+            ]
+        )
+        sample = [plan[position] for position in positions]
+        started = time.perf_counter()
+        _execute_augmentation_plan(
+            train,
+            patterns,
+            generator,
+            sample,
+            signature,
+            max_tokens=max_tokens,
+        )
+        elapsed = time.perf_counter() - started
+        seconds_per_generation = elapsed / sample_size
+        return {
+            **plan_report,
+            "mode": "benchmark",
+            "benchmark_rows": sample_size,
+            "benchmark_seconds": round(elapsed, 3),
+            "seconds_per_generation": round(seconds_per_generation, 3),
+            "estimated_total_seconds": round(
+                seconds_per_generation * len(plan), 3
+            ),
+            "estimated_total_hours": round(
+                seconds_per_generation * len(plan) / 3600, 3
+            ),
+            "generator": generator.name,
+            "generator_metadata": _generator_metadata(generator),
+            "plan_signature": signature,
+        }
+
+    output.mkdir(parents=True, exist_ok=True)
+    plan_manifest_path = output / "augmentation_plan.json"
+    state_path = output / "augmentation_state.json"
+    progress_path = output / "augmentation_progress.jsonl"
+    previous_state: dict[str, Any] = {}
+    if state_path.exists():
+        with state_path.open(encoding="utf-8") as handle:
+            previous_state = json.load(handle)
+        if previous_state.get("plan_signature") != signature:
+            raise RuntimeError(
+                "Existing augmentation state belongs to a different plan."
+            )
+    resume_count = int(previous_state.get("resume_count", 0))
+    if resume and progress_path.exists():
+        resume_count += 1
+    _atomic_json(
+        plan_manifest_path,
+        {
+            **plan_report,
+            "plan_signature": signature,
+            "items": plan,
+            "generator": generator.name,
+            "generator_metadata": _generator_metadata(generator),
+        },
+    )
+    _atomic_json(
+        state_path,
+        {
+            "status": "running",
+            "plan_signature": signature,
+            "resume_count": resume_count,
+            "planned_generation_rows": len(plan),
+        },
+    )
     augmented, report = augment_source_training(
         meisd,
         patterns,
@@ -760,18 +1161,31 @@ def run_augmentation_pipeline(
         seed=seed,
         min_compatible_samples=min_compatible_samples,
         max_aug_per_group=max_aug_per_group,
+        progress_path=progress_path,
+        checkpoint_every=checkpoint_every,
+        resume=resume,
+        max_tokens=max_tokens,
     )
-    augmented.to_csv(output / "meisd_target_style_augmented.csv", index=False)
+    report["resume_count"] = resume_count
     one_hot, emotions = to_one_hot_source(augmented)
-    one_hot.to_csv(output / "meisd_target_style_onehot.csv", index=False)
     manifest = {
         **report,
         "emotions": emotions,
         "prepared_esconv_sha256": _file_sha256(prepared_esconv_path),
         "prepared_meisd_sha256": _file_sha256(prepared_meisd_path),
     }
-    with (output / "augmentation_manifest.json").open(
-        "w", encoding="utf-8"
-    ) as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
+    _atomic_csv(output / "meisd_target_style_augmented.csv", augmented)
+    _atomic_csv(output / "meisd_target_style_onehot.csv", one_hot)
+    _atomic_json(output / "esconv_train_style_patterns.json", patterns)
+    _atomic_json(output / "augmentation_manifest.json", manifest)
+    _atomic_json(
+        state_path,
+        {
+            "status": "complete",
+            "plan_signature": signature,
+            "resume_count": resume_count,
+            "planned_generation_rows": len(plan),
+            "completed_generation_rows": len(plan),
+        },
+    )
     return manifest

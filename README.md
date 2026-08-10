@@ -105,6 +105,15 @@ Llama-2 GGUF augmentation additionally requires:
 python -m pip install -e ".[augmentation]"
 ```
 
+On Windows with an AMD GPU, replace the default CPU wheel with the Vulkan
+wheel:
+
+```powershell
+python -m pip uninstall -y llama-cpp-python
+python -m pip install --only-binary=:all: llama-cpp-python `
+  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/vulkan
+```
+
 ## End-to-end commands
 
 Paths and all research hyperparameters live in `configs/experiment.json`.
@@ -118,7 +127,13 @@ python -m mlkt.cli prepare-transfer
 
 # 3. Generate the single target-style augmented MEISD dataset.
 python -m mlkt.cli augment-transfer `
-  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf
+  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf `
+  --gpu-layers -1 --batch-size 1024 --require-gpu --resume
+
+# Benchmark 50 representative generations without writing final outputs.
+python -m mlkt.cli augment-transfer `
+  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf `
+  --gpu-layers -1 --batch-size 1024 --require-gpu --benchmark 50
 
 # A non-semantic pipeline smoke test:
 python -m mlkt.cli augment-transfer --mock-generator `
@@ -139,6 +154,10 @@ python -m mlkt.cli analyze-strategies
 # 8. Aggregate seeds, transfer deltas, curves, and confusion tables.
 python -m mlkt.cli report
 ```
+
+Full augmentation appends every result to `augmentation_progress.jsonl`.
+Repeating the same command with `--resume` continues from that file. Final CSV
+and manifest files are replaced atomically only after the plan is complete.
 
 Single-run example:
 

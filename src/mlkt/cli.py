@@ -154,8 +154,11 @@ def augment_transfer(args: argparse.Namespace) -> None:
     config_path = Path(args.config).resolve()
     config = _load_config(config_path)
     transfer = config["transfer"]
+    augmentation = transfer["augmentation"]
     prepared_dir = _config_output_path(transfer["prepared_dir"], config_path)
     if args.mock_generator:
+        if args.require_gpu:
+            raise ValueError("--require-gpu cannot be used with --mock-generator.")
         generator = DeterministicMockGenerator()
     else:
         if not args.llama_model:
@@ -164,8 +167,19 @@ def augment_transfer(args: argparse.Namespace) -> None:
             )
         generator = LlamaCppGenerator(
             args.llama_model,
-            context_size=transfer["augmentation"]["context_size"],
-            threads=transfer["augmentation"]["threads"],
+            context_size=augmentation["context_size"],
+            threads=augmentation["threads"],
+            gpu_layers=(
+                args.gpu_layers
+                if args.gpu_layers is not None
+                else augmentation.get("gpu_layers", -1)
+            ),
+            batch_size=(
+                args.batch_size
+                if args.batch_size is not None
+                else augmentation.get("batch_size", 1024)
+            ),
+            require_gpu=args.require_gpu,
         )
     manifest = run_augmentation_pipeline(
         prepared_esconv_path=prepared_dir / "esconv_transfer_prepared.csv",
@@ -174,10 +188,16 @@ def augment_transfer(args: argparse.Namespace) -> None:
         or _config_output_path(transfer["augmented_dir"], config_path),
         generator=generator,
         seed=config["seed"],
-        min_compatible_samples=transfer["augmentation"][
-            "min_compatible_samples"
-        ],
-        max_aug_per_group=transfer["augmentation"]["max_aug_per_group"],
+        min_compatible_samples=augmentation["min_compatible_samples"],
+        max_aug_per_group=augmentation["max_aug_per_group"],
+        checkpoint_every=(
+            args.checkpoint_every
+            if args.checkpoint_every is not None
+            else augmentation.get("checkpoint_every", 25)
+        ),
+        resume=args.resume,
+        max_tokens=augmentation.get("max_tokens", 150),
+        benchmark=args.benchmark,
     )
     print(json.dumps(manifest, indent=2))
 
@@ -371,6 +391,12 @@ def build_parser() -> argparse.ArgumentParser:
     augment_parser.add_argument("--llama-model")
     augment_parser.add_argument("--mock-generator", action="store_true")
     augment_parser.add_argument("--output-dir")
+    augment_parser.add_argument("--gpu-layers", type=int)
+    augment_parser.add_argument("--batch-size", type=int)
+    augment_parser.add_argument("--checkpoint-every", type=int)
+    augment_parser.add_argument("--resume", action="store_true")
+    augment_parser.add_argument("--require-gpu", action="store_true")
+    augment_parser.add_argument("--benchmark", type=int, metavar="N")
     augment_parser.set_defaults(function=augment_transfer)
 
     source_parser = subparsers.add_parser("pretrain-transfer")

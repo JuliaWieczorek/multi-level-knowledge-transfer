@@ -8,8 +8,24 @@ from mlkt.transfer import (
     DeterministicMockGenerator,
     attach_segment_conversation_ids,
     augment_source_training,
+    build_augmentation_plan,
     extract_style_patterns,
 )
+
+
+class InterruptingGenerator:
+    name = "interrupting-mock"
+
+    def __init__(self, successful_calls: int) -> None:
+        self.successful_calls = successful_calls
+        self.calls = 0
+        self.delegate = DeterministicMockGenerator()
+
+    def generate(self, prompt: str, max_tokens: int, seed: int) -> str:
+        if self.calls >= self.successful_calls:
+            raise KeyboardInterrupt
+        self.calls += 1
+        return self.delegate.generate(prompt, max_tokens, seed)
 
 
 class TransferPipelineTests(unittest.TestCase):
@@ -108,6 +124,95 @@ class TransferPipelineTests(unittest.TestCase):
         validation = augmented[augmented["split"] == "validation"]
         self.assertFalse(validation["augmented"].any())
         self.assertEqual(report["validation_rows"], 1)
+
+    def test_plan_is_deterministic_and_resume_has_no_duplicates(self):
+        esconv = pd.DataFrame(
+            [
+                {
+                    "conversation_id": f"esconv_{index:04d}",
+                    "split": "train",
+                    "Utterances": "I cannot stop thinking about this situation",
+                    "sentiment": "negative",
+                    "emotion1": emotion,
+                    "intensity1": 2,
+                    "emotion2": "",
+                    "intensity2": pd.NA,
+                    "emotion3": "",
+                    "intensity3": pd.NA,
+                }
+                for index, emotion in enumerate(("anger", "disgust"))
+            ]
+        )
+        patterns = extract_style_patterns(esconv)
+        rows = []
+        for index, emotion in enumerate(("anger", "anger", "anger", "disgust")):
+            rows.append(
+                {
+                    "conversation_id": f"meisd_{index:04d}",
+                    "split": "train",
+                    "Utterances": f"source message number {index}",
+                    "sentiment": "negative",
+                    "emotion1": emotion,
+                    "intensity1": 2,
+                    "emotion2": "",
+                    "intensity2": pd.NA,
+                    "emotion3": "",
+                    "intensity3": pd.NA,
+                }
+            )
+        meisd = pd.DataFrame(rows)
+        _, _, first_plan, _ = build_augmentation_plan(
+            meisd, patterns, min_compatible_samples=1
+        )
+        _, _, second_plan, _ = build_augmentation_plan(
+            meisd, patterns, min_compatible_samples=1
+        )
+        self.assertEqual(first_plan, second_plan)
+        self.assertEqual(len(first_plan), 2)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            progress = Path(temporary) / "progress.jsonl"
+            with self.assertRaises(KeyboardInterrupt):
+                augment_source_training(
+                    meisd,
+                    patterns,
+                    InterruptingGenerator(successful_calls=1),
+                    min_compatible_samples=1,
+                    progress_path=progress,
+                    checkpoint_every=1,
+                )
+            with progress.open("a", encoding="utf-8") as handle:
+                handle.write('{"truncated":')
+            resumed, resumed_report = augment_source_training(
+                meisd,
+                patterns,
+                DeterministicMockGenerator(),
+                min_compatible_samples=1,
+                progress_path=progress,
+                checkpoint_every=1,
+                resume=True,
+            )
+            uninterrupted, _ = augment_source_training(
+                meisd,
+                patterns,
+                DeterministicMockGenerator(),
+                min_compatible_samples=1,
+            )
+
+        resumed_augmented = resumed[resumed["augmented"]].reset_index(drop=True)
+        uninterrupted_augmented = uninterrupted[
+            uninterrupted["augmented"]
+        ].reset_index(drop=True)
+        self.assertEqual(len(resumed_augmented), 2)
+        self.assertEqual(
+            resumed_augmented["generation_seed"].tolist(),
+            uninterrupted_augmented["generation_seed"].tolist(),
+        )
+        self.assertEqual(
+            resumed_augmented["source_conversation_id"].tolist(),
+            uninterrupted_augmented["source_conversation_id"].tolist(),
+        )
+        self.assertEqual(resumed_report["resume_count"], 1)
 
 
 if __name__ == "__main__":
