@@ -332,6 +332,25 @@ class NeuralContractTests(unittest.TestCase):
         self.assertEqual(_outcome_trainable_layers(3, config), 4)
         self.assertIsNone(_outcome_trainable_layers(4, config))
 
+    def test_joint_outcome_sampler_upweights_rare_pairs(self):
+        import pandas as pd
+
+        from mlkt.training import _outcome_sampling_weights
+
+        frame = pd.DataFrame(
+            {
+                "final_intensity": [1, 1, 1, 1, 4],
+                "drop_magnitude": [2, 2, 2, 2, 1],
+            }
+        )
+        weights = _outcome_sampling_weights(
+            frame, strategy="joint", power=0.5, max_ratio=4.0
+        )
+        self.assertIsNotNone(weights)
+        self.assertGreater(float(weights[-1]), float(weights[0]))
+        self.assertAlmostEqual(float(weights.mean()), 1.0)
+        self.assertIsNone(_outcome_sampling_weights(frame, strategy="none"))
+
     def test_affective_encoder_exposes_only_top_layers(self):
         import torch
         from torch import nn

@@ -383,6 +383,21 @@ def train_outcome_ceiling(args: argparse.Namespace) -> None:
             "use_strategy": strategy,
         }
     )
+    override_names = (
+        "outcome_sampling_strategy",
+        "joint_sampling_power",
+        "joint_sampling_max_ratio",
+        "outcome_focal_gamma",
+        "ordinal_auxiliary_weight",
+        "consistency_weight",
+        "auxiliary_regression_weight",
+    )
+    for name in override_names:
+        value = getattr(args, name, None)
+        if value is not None:
+            ceiling_config[name] = value
+    if args.validation_only:
+        ceiling_config["evaluate_test"] = False
     transfer_checkpoint = args.source_checkpoint
     if args.transfer and not transfer_checkpoint:
         source_root = _config_output_path(
@@ -396,13 +411,15 @@ def train_outcome_ceiling(args: argparse.Namespace) -> None:
     transfer_variant = (
         "transferred" if transfer_checkpoint is not None else "vanilla"
     )
-    output_dir = Path(
-        args.output_dir
-        or _config_output_path(ceiling_config["output_dir"], config_path)
+    default_output = (
+        _config_output_path(ceiling_config["output_dir"], config_path)
         / f"seed_{args.seed}"
         / args.architecture
         / transfer_variant
     )
+    if args.run_name:
+        default_output = default_output / args.run_name
+    output_dir = Path(args.output_dir or default_output)
     summary = train_outcome_ceiling_model(
         checkpoints_path=args.input
         or _resolve_config_path(
@@ -412,6 +429,23 @@ def train_outcome_ceiling(args: argparse.Namespace) -> None:
         seed=args.seed,
         config=ceiling_config,
         transfer_checkpoint_path=transfer_checkpoint,
+    )
+    print(json.dumps(summary, indent=2))
+
+
+def analyze_outcome_errors(args: argparse.Namespace) -> None:
+    from .outcome_analysis import analyze_outcome_errors as run_analysis
+
+    config_path = Path(args.config).resolve()
+    config = _load_config(config_path)
+    summary = run_analysis(
+        predictions_path=args.predictions,
+        checkpoints_path=args.input
+        or _resolve_config_path(
+            config["outcome_ceiling"]["checkpoints_path"], config_path
+        ),
+        output_dir=args.output_dir,
+        min_group_size=args.min_group_size,
     )
     print(json.dumps(summary, indent=2))
 
@@ -597,12 +631,31 @@ def build_parser() -> argparse.ArgumentParser:
     outcome_transfer.add_argument("--transfer", action="store_true")
     outcome_transfer.add_argument("--vanilla", action="store_true")
     outcome_parser.add_argument("--source-checkpoint")
+    outcome_parser.add_argument("--run-name")
+    outcome_parser.add_argument("--validation-only", action="store_true")
+    outcome_parser.add_argument(
+        "--outcome-sampling-strategy", choices=("none", "joint")
+    )
+    outcome_parser.add_argument("--joint-sampling-power", type=float)
+    outcome_parser.add_argument("--joint-sampling-max-ratio", type=float)
+    outcome_parser.add_argument("--outcome-focal-gamma", type=float)
+    outcome_parser.add_argument("--ordinal-auxiliary-weight", type=float)
+    outcome_parser.add_argument("--consistency-weight", type=float)
+    outcome_parser.add_argument("--auxiliary-regression-weight", type=float)
     outcome_parser.add_argument(
         "--architecture",
         choices=("base", "speaker", "trajectory", "strategies", "full"),
         default="full",
     )
     outcome_parser.set_defaults(function=train_outcome_ceiling)
+
+    outcome_analysis_parser = subparsers.add_parser("analyze-outcome-errors")
+    outcome_analysis_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    outcome_analysis_parser.add_argument("--input")
+    outcome_analysis_parser.add_argument("--predictions", required=True)
+    outcome_analysis_parser.add_argument("--output-dir", required=True)
+    outcome_analysis_parser.add_argument("--min-group-size", type=int, default=5)
+    outcome_analysis_parser.set_defaults(function=analyze_outcome_errors)
 
     matrix_parser = subparsers.add_parser("run-matrix")
     matrix_parser.add_argument("--config", default=str(DEFAULT_CONFIG))

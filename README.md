@@ -174,6 +174,18 @@ python -m mlkt.cli pretrain-transfer --aligned-negative --seed 42
 python -m mlkt.cli train-outcome-ceiling --vanilla --architecture full --seed 42
 python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42
 
+# Diagnose a completed run without refitting or touching model selection.
+python -m mlkt.cli analyze-outcome-errors --predictions outputs/outcome_ceiling/seed_42/full/transferred/test_predictions.csv --output-dir outputs/outcome_ceiling/seed_42/full/transferred/error_analysis
+
+# Validation-only ablations: the test split is deliberately not evaluated.
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name ablation_no_focal --outcome-focal-gamma 0
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name ablation_no_ordinal --ordinal-auxiliary-weight 0
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name ablation_no_consistency --consistency-weight 0
+
+# Rare-pair balancing. Start with square-root inverse joint frequency so it
+# does not duplicate the full strength of class-balanced focal loss.
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name joint_balanced_p05 --outcome-sampling-strategy joint --joint-sampling-power 0.5
+
 # Architecture ablations (repeat with --transfer after the vanilla control).
 python -m mlkt.cli train-outcome-ceiling --vanilla --architecture base --seed 42
 python -m mlkt.cli train-outcome-ceiling --vanilla --architecture speaker --seed 42

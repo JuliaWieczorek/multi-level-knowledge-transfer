@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
@@ -76,6 +76,46 @@ def _class_weights(
     counts = np.asarray([(array == label).sum() for label in classes], dtype=float)
     weights = len(array) / (len(classes) * np.maximum(counts, 1.0))
     return torch.tensor(weights, dtype=torch.float, device=device)
+
+
+def _outcome_sampling_weights(
+    frame: pd.DataFrame,
+    strategy: str = "none",
+    power: float = 0.5,
+    max_ratio: float = 4.0,
+) -> torch.Tensor | None:
+    """Return deterministic sample weights for rare valid outcome pairs.
+
+    The structured decoder couples final intensity and drop magnitude, so the
+    balancing unit is their joint pair rather than either marginal label.
+    ``power=0.5`` applies square-root inverse frequency and avoids duplicating
+    the strongest class-weight correction already present in focal loss.
+    """
+    if strategy == "none":
+        return None
+    if strategy != "joint":
+        raise ValueError("outcome_sampling_strategy must be 'none' or 'joint'.")
+    if not 0.0 < power <= 1.0:
+        raise ValueError("joint_sampling_power must be in (0, 1].")
+    if max_ratio < 1.0:
+        raise ValueError("joint_sampling_max_ratio must be at least 1.")
+    required = {"final_intensity", "drop_magnitude"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Missing outcome sampling columns: {sorted(missing)}")
+
+    pairs = list(
+        zip(
+            frame["final_intensity"].astype(int),
+            frame["drop_magnitude"].astype(int),
+        )
+    )
+    counts = pd.Series(pairs, dtype="object").value_counts().to_dict()
+    raw = np.asarray([counts[pair] ** (-power) for pair in pairs], dtype=float)
+    raw /= raw.min()
+    raw = np.minimum(raw, float(max_ratio))
+    raw /= raw.mean()
+    return torch.tensor(raw, dtype=torch.double)
 
 
 def _move_tensors(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -1583,12 +1623,30 @@ def train_outcome_ceiling_model(
         outcome_ceiling_collate, pad_token_id=tokenizer.pad_token_id or 0
     )
     generator = torch.Generator().manual_seed(seed)
+    sampling_strategy = str(config.get("outcome_sampling_strategy", "none"))
+    sampling_weights = _outcome_sampling_weights(
+        train,
+        strategy=sampling_strategy,
+        power=float(config.get("joint_sampling_power", 0.5)),
+        max_ratio=float(config.get("joint_sampling_max_ratio", 4.0)),
+    )
+    train_sampler = (
+        WeightedRandomSampler(
+            sampling_weights,
+            num_samples=len(sampling_weights),
+            replacement=True,
+            generator=generator,
+        )
+        if sampling_weights is not None
+        else None
+    )
     loaders = {
         "train": DataLoader(
             datasets["train"],
             batch_size=config["batch_size"],
-            shuffle=True,
-            generator=generator,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            generator=generator if train_sampler is None else None,
             collate_fn=collate,
             num_workers=config.get("num_workers", 0),
         ),
@@ -1694,6 +1752,16 @@ def train_outcome_ceiling_model(
         "threshold_positive_weights": threshold_weights.detach().cpu().tolist(),
         "final_class_weights": final_class_weights.detach().cpu().tolist(),
         "drop_class_weights": drop_class_weights.detach().cpu().tolist(),
+        "outcome_sampling_strategy": sampling_strategy,
+        "sampling_weight_summary": (
+            {
+                "minimum": float(sampling_weights.min()),
+                "maximum": float(sampling_weights.max()),
+                "mean": float(sampling_weights.mean()),
+            }
+            if sampling_weights is not None
+            else None
+        ),
         "architecture": config.get("architecture", "base"),
         "config": config,
     }
@@ -1765,7 +1833,12 @@ def train_outcome_ceiling_model(
 
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     metric_rows: list[dict[str, Any]] = []
-    for split_name in ("validation", "test"):
+    evaluation_splits = (
+        ("validation", "test")
+        if config.get("evaluate_test", True)
+        else ("validation",)
+    )
+    for split_name in evaluation_splits:
         metrics, predictions = _run_outcome_ceiling_epoch(
             model,
             loaders[split_name],
@@ -1847,6 +1920,7 @@ def train_outcome_ceiling_model(
         "source_checkpoint": run_config["source_checkpoint"],
         "source_checkpoint_sha256": source_checkpoint_hash,
         "device": str(device),
+        "test_evaluated": "test" in evaluation_splits,
         "duration_seconds": time.time() - started_at,
     }
     with (output / "run_manifest.json").open("w", encoding="utf-8") as handle:
