@@ -18,6 +18,20 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor, dimension: int) -> tor
     return numerator / denominator
 
 
+def weighted_chunk_mean(
+    values: torch.Tensor,
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    """Pool chunks with continuous weights, falling back for empty phases."""
+    effective = weights.to(values.dtype) * mask.to(values.dtype)
+    numerator = (values * effective.unsqueeze(-1)).sum(dim=1)
+    denominator = effective.sum(dim=1, keepdim=True)
+    pooled = numerator / denominator.clamp_min(1e-8)
+    return torch.where(denominator > 0, pooled, fallback)
+
+
 class BinaryFocalLoss(nn.Module):
     def __init__(self, gamma: float = 2.0, alpha: torch.Tensor | None = None) -> None:
         super().__init__()
@@ -142,6 +156,7 @@ class AffectiveTextEncoder(nn.Module):
         self.max_chunks = max_chunks
         self.gate = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.Sigmoid())
         self.chunk_positions = nn.Embedding(max_chunks, hidden)
+        self.speaker_projection = nn.Linear(2, hidden, bias=False)
         layer = nn.TransformerEncoderLayer(
             d_model=hidden,
             nhead=chunk_heads,
@@ -153,12 +168,51 @@ class AffectiveTextEncoder(nn.Module):
         self.chunk_encoder = nn.TransformerEncoder(layer, num_layers=chunk_layers)
         self.dropout = nn.Dropout(dropout)
 
+    def set_trainable_layers(self, top_layers: int | None) -> None:
+        """Freeze the encoder or expose only its top transformer layers.
+
+        ``None`` unfreezes the complete affective encoder, ``0`` freezes it,
+        and a positive value trains that many top layers in both transferred
+        BERT backbones together with the target-domain fusion modules.
+        """
+        if top_layers is not None and top_layers < 0:
+            raise ValueError("top_layers cannot be negative.")
+        for parameter in self.parameters():
+            parameter.requires_grad = top_layers is None
+        if top_layers in (None, 0):
+            return
+
+        fusion_modules = (
+            self.gate,
+            self.chunk_positions,
+            self.speaker_projection,
+            self.chunk_encoder,
+        )
+        for module in fusion_modules:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+
+        for backbone in (self.emotion_encoder, self.intensity_encoder):
+            encoder = getattr(backbone, "encoder", None)
+            layers = getattr(encoder, "layer", None)
+            if layers is None:
+                for parameter in backbone.parameters():
+                    parameter.requires_grad = True
+                continue
+            selected = list(layers)[-min(top_layers, len(layers)) :]
+            for layer in selected:
+                for parameter in layer.parameters():
+                    parameter.requires_grad = True
+
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         chunk_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        speaker_features: torch.Tensor | None = None,
+        trajectory_features: torch.Tensor | None = None,
+        return_trajectory: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         batch, chunks, tokens = input_ids.shape
         if chunks > self.max_chunks:
             raise ValueError(
@@ -176,11 +230,33 @@ class AffectiveTextEncoder(nn.Module):
         combined = gate * emotion + (1.0 - gate) * intensity
         combined = combined.reshape(batch, chunks, self.hidden_size)
         positions = torch.arange(chunks, device=input_ids.device).unsqueeze(0)
-        combined = self.dropout(combined + self.chunk_positions(positions))
+        combined = combined + self.chunk_positions(positions)
+        if speaker_features is not None:
+            if speaker_features.shape != (batch, chunks, 2):
+                raise ValueError("Speaker features must have shape [batch, chunks, 2].")
+            combined = combined + self.speaker_projection(speaker_features)
+        combined = self.dropout(combined)
         encoded = self.chunk_encoder(
             combined, src_key_padding_mask=~chunk_mask.bool()
         )
-        return masked_mean(encoded, chunk_mask, dimension=1)
+        overall = masked_mean(encoded, chunk_mask, dimension=1)
+        if not return_trajectory:
+            return overall
+        if trajectory_features is None or trajectory_features.shape != (
+            batch,
+            chunks,
+            2,
+        ):
+            raise ValueError(
+                "Trajectory features must have shape [batch, chunks, 2]."
+            )
+        early = weighted_chunk_mean(
+            encoded, trajectory_features[:, :, 0], chunk_mask, overall
+        )
+        late = weighted_chunk_mean(
+            encoded, trajectory_features[:, :, 1], chunk_mask, overall
+        )
+        return {"overall": overall, "early": early, "late": late}
 
 
 class StrategyEncoder(nn.Module):
@@ -340,6 +416,206 @@ class TemporalMultiModalModel(nn.Module):
             "final_intensity": self.final_head(shared),
             "drop_magnitude": self.drop_head(shared),
         }
+
+
+def cumulative_ordinal_targets(
+    labels: torch.Tensor, num_classes: int = 4
+) -> torch.Tensor:
+    """Encode labels 1..K as cumulative targets [y>1, ..., y>K-1]."""
+    if labels.ndim != 1:
+        raise ValueError("Ordinal labels must be a one-dimensional tensor.")
+    if labels.numel() and (
+        int(labels.min()) < 1 or int(labels.max()) > num_classes
+    ):
+        raise ValueError(f"Ordinal labels must be in 1..{num_classes}.")
+    thresholds = torch.arange(1, num_classes, device=labels.device)
+    return (labels.unsqueeze(1) > thresholds.unsqueeze(0)).to(torch.float)
+
+
+def cumulative_ordinal_predictions(
+    logits: torch.Tensor,
+    initial_intensity: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode cumulative logits and optionally enforce final < initial."""
+    if logits.ndim != 2:
+        raise ValueError("Ordinal logits must have shape [batch, thresholds].")
+    predicted = 1 + (torch.sigmoid(logits) >= 0.5).sum(dim=1)
+    if initial_intensity is not None:
+        if initial_intensity.shape != predicted.shape:
+            raise ValueError("Initial intensity must match the prediction batch.")
+        predicted = torch.minimum(predicted, initial_intensity - 1)
+    return predicted.clamp(min=1, max=logits.shape[1] + 1)
+
+
+class CumulativeOrdinalHead(nn.Module):
+    """A proportional-odds head with monotonically ordered thresholds."""
+
+    def __init__(self, input_size: int, num_classes: int = 4) -> None:
+        super().__init__()
+        if num_classes < 2:
+            raise ValueError("An ordinal head requires at least two classes.")
+        self.score = nn.Linear(input_size, 1)
+        self.first_threshold = nn.Parameter(torch.tensor(-1.0))
+        self.threshold_steps = nn.Parameter(torch.zeros(num_classes - 2))
+
+    def thresholds(self) -> torch.Tensor:
+        if self.threshold_steps.numel() == 0:
+            return self.first_threshold.unsqueeze(0)
+        increments = nn.functional.softplus(self.threshold_steps)
+        return torch.cat(
+            [
+                self.first_threshold.unsqueeze(0),
+                self.first_threshold + torch.cumsum(increments, dim=0),
+            ]
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return self.score(values) - self.thresholds().unsqueeze(0)
+
+
+class EmotionConditionedOutcomeModel(nn.Module):
+    """Role-aware full-context final-intensity model with metadata conditioning."""
+
+    def __init__(
+        self,
+        transformer_name: str,
+        transfer_checkpoint: dict[str, Any] | None,
+        emotion_vocabulary_size: int,
+        problem_vocabulary_size: int,
+        dropout: float = 0.4,
+        max_chunks: int = 32,
+        metadata_size: int = 64,
+        strategy_vocabulary_size: int = 0,
+        strategy_numeric_size: int = 0,
+        strategy_hidden_size: int = 256,
+        use_speaker_features: bool = False,
+        use_trajectory: bool = False,
+        use_strategy: bool = False,
+        use_auxiliary_regression: bool = True,
+    ) -> None:
+        super().__init__()
+        self.text_encoder = AffectiveTextEncoder(
+            transformer_name=transformer_name,
+            transfer_checkpoint=transfer_checkpoint,
+            dropout=dropout,
+            max_chunks=max_chunks,
+        )
+        hidden = self.text_encoder.hidden_size
+        self.use_speaker_features = use_speaker_features
+        self.use_trajectory = use_trajectory
+        self.use_strategy = use_strategy
+        self.use_auxiliary_regression = use_auxiliary_regression
+        self.trajectory_projection: nn.Module | None = None
+        if use_trajectory:
+            self.trajectory_projection = nn.Sequential(
+                nn.Linear(hidden * 4, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+        self.strategy_encoder: StrategyEncoder | None = None
+        if use_strategy:
+            if strategy_vocabulary_size < 2 or strategy_numeric_size < 1:
+                raise ValueError("Strategy-aware models require strategy dimensions.")
+            self.strategy_encoder = StrategyEncoder(
+                vocabulary_size=strategy_vocabulary_size,
+                numeric_size=strategy_numeric_size,
+                hidden_size=strategy_hidden_size,
+                dropout=dropout,
+            )
+            self.strategy_to_text = nn.Linear(strategy_hidden_size, hidden)
+            self.strategy_gate = nn.Sequential(
+                nn.Linear(hidden * 2, hidden),
+                nn.Sigmoid(),
+            )
+        self.emotion_embedding = nn.Embedding(
+            emotion_vocabulary_size, metadata_size, padding_idx=0
+        )
+        self.problem_embedding = nn.Embedding(
+            problem_vocabulary_size, metadata_size, padding_idx=0
+        )
+        self.initial_embedding = nn.Embedding(6, metadata_size, padding_idx=0)
+        self.conditioning = nn.Sequential(
+            nn.Linear(metadata_size * 3, hidden * 2),
+            nn.Tanh(),
+        )
+        self.normalisation = nn.LayerNorm(hidden)
+        self.shared = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        # Direct class heads optimise the metric used for model selection.  The
+        # ordinal and regression heads remain as auxiliary objectives so that
+        # the representation still respects distance between intensity levels.
+        self.final_class_head = nn.Linear(hidden // 2, 4)
+        self.drop_class_head = nn.Linear(hidden // 2, 4)
+        self.final_head = CumulativeOrdinalHead(hidden // 2, num_classes=4)
+        self.drop_regression_head = (
+            nn.Linear(hidden // 2, 1) if use_auxiliary_regression else None
+        )
+
+    def set_text_encoder_trainable(self, trainable: bool) -> None:
+        for parameter in self.text_encoder.parameters():
+            parameter.requires_grad = trainable
+
+    def set_text_encoder_trainable_layers(self, top_layers: int | None) -> None:
+        self.text_encoder.set_trainable_layers(top_layers)
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        text_output = self.text_encoder(
+            batch["input_ids"],
+            batch["attention_mask"],
+            batch["chunk_mask"],
+            speaker_features=(
+                batch["speaker_features"] if self.use_speaker_features else None
+            ),
+            trajectory_features=(
+                batch["trajectory_features"] if self.use_trajectory else None
+            ),
+            return_trajectory=self.use_trajectory,
+        )
+        if self.use_trajectory:
+            assert isinstance(text_output, dict)
+            assert self.trajectory_projection is not None
+            early = text_output["early"]
+            late = text_output["late"]
+            text = self.trajectory_projection(
+                torch.cat([text_output["overall"], early, late, late - early], dim=-1)
+            )
+        else:
+            assert isinstance(text_output, torch.Tensor)
+            text = text_output
+        if self.strategy_encoder is not None:
+            strategy = self.strategy_encoder(
+                batch["strategy_ids"],
+                batch["strategy_positions"],
+                batch["strategy_mask"],
+                batch["strategy_numeric"],
+            )
+            projected_strategy = self.strategy_to_text(strategy)
+            gate = self.strategy_gate(torch.cat([text, projected_strategy], dim=-1))
+            text = gate * text + (1.0 - gate) * projected_strategy
+        metadata = torch.cat(
+            [
+                self.emotion_embedding(batch["emotion_id"]),
+                self.problem_embedding(batch["problem_id"]),
+                self.initial_embedding(batch["initial_intensity"]),
+            ],
+            dim=-1,
+        )
+        gamma, beta = self.conditioning(metadata).chunk(2, dim=-1)
+        conditioned = self.normalisation(text * (1.0 + gamma) + beta)
+        shared = self.shared(conditioned)
+        outputs = {
+            "final_logits": self.final_class_head(shared),
+            "drop_logits": self.drop_class_head(shared),
+            "final_ordinal_logits": self.final_head(shared),
+        }
+        if self.drop_regression_head is not None:
+            outputs["drop_regression"] = 1.0 + 3.0 * torch.sigmoid(
+                self.drop_regression_head(shared).squeeze(-1)
+            )
+        return outputs
 
 
 def temporal_multitask_loss(

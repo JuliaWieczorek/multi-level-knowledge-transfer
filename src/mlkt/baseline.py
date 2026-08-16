@@ -233,3 +233,120 @@ def run_initial_only_baseline(
             predictions["model"] = "initial_only_logistic_regression"
             prediction_frames.append(predictions)
     return pd.DataFrame(metric_rows), pd.concat(prediction_frames, ignore_index=True)
+
+
+def run_outcome_metadata_baselines(
+    frame: pd.DataFrame,
+    checkpoint: float = 1.0,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Predict final intensity from pre-outcome metadata and derive drop exactly."""
+    try:
+        from sklearn.compose import ColumnTransformer
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    except ImportError as error:
+        raise RuntimeError("The metadata baselines require scikit-learn.") from error
+
+    required = {
+        "dataset",
+        "conversation_id",
+        "checkpoint",
+        "split",
+        "initial_intensity",
+        "emotion_family",
+        "problem_type",
+        "final_intensity",
+        "drop_magnitude",
+    }
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Missing metadata baseline columns: {sorted(missing)}")
+    subset = frame[frame["checkpoint"].astype(float).sub(checkpoint).abs() < 1e-8]
+    if subset.empty:
+        raise ValueError(f"No rows found for checkpoint {checkpoint}.")
+    train = subset[subset["split"] == "train"]
+    specifications = {
+        "initial": ["initial_intensity"],
+        "emotion": ["emotion_family"],
+        "initial_emotion": ["initial_intensity", "emotion_family"],
+        "initial_emotion_problem": [
+            "initial_intensity",
+            "emotion_family",
+            "problem_type",
+        ],
+    }
+    metric_rows: list[dict[str, Any]] = []
+    prediction_frames: list[pd.DataFrame] = []
+    for model_name, feature_columns in specifications.items():
+        numeric = [name for name in feature_columns if name == "initial_intensity"]
+        categorical = [name for name in feature_columns if name not in numeric]
+        transformers = []
+        if categorical:
+            transformers.append(
+                ("categorical", OneHotEncoder(handle_unknown="ignore"), categorical)
+            )
+        if numeric:
+            transformers.append(("numeric", StandardScaler(), numeric))
+        model = Pipeline(
+            [
+                ("features", ColumnTransformer(transformers)),
+                (
+                    "classifier",
+                    LogisticRegression(
+                        class_weight="balanced", max_iter=2_000, random_state=seed
+                    ),
+                ),
+            ]
+        )
+        model.fit(train[feature_columns], train["final_intensity"])
+        for split_name in ("validation", "test"):
+            split_frame = subset[subset["split"] == split_name]
+            final_prediction = model.predict(split_frame[feature_columns]).astype(int)
+            # All supervised rows represent a decrease, so final must be below initial.
+            final_prediction = final_prediction.clip(1, 4)
+            final_prediction = pd.Series(
+                final_prediction, index=split_frame.index
+            ).clip(upper=split_frame["initial_intensity"] - 1).astype(int)
+            drop_prediction = (
+                split_frame["initial_intensity"] - final_prediction
+            ).astype(int)
+            predictions = split_frame[
+                [
+                    "dataset",
+                    "conversation_id",
+                    "checkpoint",
+                    "initial_intensity",
+                    "emotion_family",
+                    "problem_type",
+                    "final_intensity",
+                    "drop_magnitude",
+                ]
+            ].copy()
+            predictions["final_prediction"] = final_prediction
+            predictions["drop_prediction"] = drop_prediction
+            predictions["split"] = split_name
+            predictions["model"] = model_name
+            prediction_frames.append(predictions)
+            for task, target, predicted in (
+                (
+                    "final_intensity",
+                    split_frame["final_intensity"],
+                    final_prediction,
+                ),
+                ("drop_magnitude", split_frame["drop_magnitude"], drop_prediction),
+            ):
+                scores = classification_metrics(target, predicted, labels=(1, 2, 3, 4))
+                scores.update(ordinal_metrics(target, predicted, labels=(1, 2, 3, 4)))
+                metric_rows.append(
+                    {
+                        "checkpoint": checkpoint,
+                        "checkpoint_percent": int(round(checkpoint * 100)),
+                        "split": split_name,
+                        "task": task,
+                        "model": model_name,
+                        **scores,
+                    }
+                )
+    return pd.DataFrame(metric_rows), pd.concat(prediction_frames, ignore_index=True)

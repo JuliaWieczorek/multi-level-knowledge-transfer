@@ -36,6 +36,16 @@ Text contains only observed seeker turns. Strategies contain only annotations
 available in the observed prefix. A `NO_STRATEGY` token represents prefixes
 that have not yet observed a supporter strategy.
 
+Before extending this matrix, the project now includes a stricter 100% context
+ceiling experiment. It consumes the complete role-marked dialogue plus
+train-vocabulary encodings of initial intensity, a MEISD-compatible negative
+emotion family, and problem type. A cumulative ordinal head predicts final
+intensity; drop magnitude is derived exactly as `initial - final`, so the two
+reported outcomes cannot contradict each other. Its full architecture also
+adds continuous speaker composition for every text chunk, separate early and
+late seeker representations, an ordered strategy encoder, and an auxiliary
+drop-regression loss used only as a training regulariser.
+
 ## Reused transfer pipeline
 
 One source transfer model is trained per random seed and shared by all five
@@ -157,6 +167,18 @@ python -m mlkt.cli analyze-strategies
 
 # 8. Aggregate seeds, transfer deltas, curves, and confusion tables.
 python -m mlkt.cli report
+
+# Controlled full-context baselines and ordinal ceiling experiment.
+python -m mlkt.cli outcome-baselines
+python -m mlkt.cli pretrain-transfer --aligned-negative --seed 42
+python -m mlkt.cli train-outcome-ceiling --vanilla --architecture full --seed 42
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42
+
+# Architecture ablations (repeat with --transfer after the vanilla control).
+python -m mlkt.cli train-outcome-ceiling --vanilla --architecture base --seed 42
+python -m mlkt.cli train-outcome-ceiling --vanilla --architecture speaker --seed 42
+python -m mlkt.cli train-outcome-ceiling --vanilla --architecture trajectory --seed 42
+python -m mlkt.cli train-outcome-ceiling --vanilla --architecture strategies --seed 42
 ```
 
 Full augmentation appends every result to `augmentation_progress.jsonl`.

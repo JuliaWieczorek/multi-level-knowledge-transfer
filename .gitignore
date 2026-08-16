@@ -6,6 +6,7 @@ __pycache__/
 .idea/
 data/processed/*.csv
 data/processed/transfer/
+data/processed/outcome_ceiling/
 data/ESConv_DA_ready.csv
 data/MEISD_DA_ready.csv
 *.pt

@@ -10,6 +10,26 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 
 DEFAULT_CHECKPOINTS = (0.10, 0.25, 0.50, 0.75, 1.00)
+
+NEGATIVE_EMOTION_FAMILIES = {
+    "anger": "anger",
+    "jealousy": "anger",
+    "disgust": "disgust",
+    "anxiety": "fear",
+    "fear": "fear",
+    "nervousness": "fear",
+    "depression": "sadness",
+    "guilt": "sadness",
+    "pain": "sadness",
+    "sadness": "sadness",
+    "shame": "sadness",
+}
+
+
+def negative_emotion_family(value: Any) -> str:
+    """Map ESConv's sparse negative labels to MEISD-compatible families."""
+    emotion = _normalise_text(value)
+    return NEGATIVE_EMOTION_FAMILIES.get(emotion, "other")
 ESCONV_STRATEGIES = (
     "Question",
     "Others",
@@ -172,6 +192,11 @@ def build_esconv_checkpoints(
         for checkpoint in checkpoints:
             observed = turns[: _prefix_size(len(turns), checkpoint)]
             all_text = " ".join(_normalise_text(turn.get("content")) for turn in observed)
+            role_turns = [
+                f"{str(turn.get('speaker', 'unknown')).strip().lower()}: "
+                f"{_normalise_text(turn.get('content'))}"
+                for turn in observed
+            ]
             seeker_text = " ".join(
                 _normalise_text(turn.get("content"))
                 for turn in observed
@@ -210,6 +235,7 @@ def build_esconv_checkpoints(
                 "n_observed_turns": len(observed),
                 "observed_fraction_actual": len(observed) / len(turns),
                 "text": all_text,
+                "text_role_turns": json.dumps(role_turns, ensure_ascii=False),
                 "text_seeker": seeker_text,
                 "text_seeker_turns": json.dumps(seeker_turns, ensure_ascii=False),
                 "text_supporter": supporter_text,
@@ -219,6 +245,9 @@ def build_esconv_checkpoints(
                 "drop_magnitude": initial - final,
                 "intensity_change": change_label(initial, final),
                 "emotion": _normalise_text(conversation.get("emotion_type")),
+                "emotion_family": negative_emotion_family(
+                    conversation.get("emotion_type")
+                ),
                 "problem_type": _normalise_text(conversation.get("problem_type")),
             }
             row.update(

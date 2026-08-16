@@ -30,11 +30,21 @@ from .metrics import (
 )
 from .models import (
     BinaryFocalLoss,
+    EmotionConditionedOutcomeModel,
     SoftSharingMTL,
     TemporalMultiModalModel,
+    cumulative_ordinal_predictions,
+    cumulative_ordinal_targets,
     temporal_multitask_loss,
 )
-from .neural_data import SourceMTLDataset, TemporalDataset, temporal_collate
+from .neural_data import (
+    OutcomeCeilingDataset,
+    SourceMTLDataset,
+    TemporalDataset,
+    categorical_vocabulary,
+    outcome_ceiling_collate,
+    temporal_collate,
+)
 from .strategy import strategy_feature_columns, strategy_vocabulary
 from .validation import validate_augmentation_artifacts, validate_source_training_frame
 
@@ -406,13 +416,24 @@ def pretrain_source_mtl(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     frame = pd.read_csv(source_path)
-    emotion_names = sorted(
+    available_emotion_names = sorted(
         column.split("emotion__", 1)[1]
         for column in frame.columns
         if column.startswith("emotion__")
     )
-    if not emotion_names:
+    if not available_emotion_names:
         raise ValueError("Source data has no one-hot emotion columns.")
+    configured_emotions = config.get("emotion_names")
+    emotion_names = (
+        [str(name) for name in configured_emotions]
+        if configured_emotions
+        else available_emotion_names
+    )
+    missing_emotions = sorted(set(emotion_names) - set(available_emotion_names))
+    if missing_emotions:
+        raise ValueError(
+            f"Configured source emotions are unavailable: {missing_emotions}"
+        )
     augmentation_report = validate_augmentation_artifacts(source_path, frame)
     frame, input_report = validate_source_training_frame(
         frame,
@@ -427,7 +448,43 @@ def pretrain_source_mtl(
             "drop_conflicting_train_texts", True
         ),
     )
+    synthetic_ratio = config.get("max_synthetic_to_original_ratio")
+    if synthetic_ratio is not None:
+        synthetic_ratio = float(synthetic_ratio)
+        if synthetic_ratio < 0:
+            raise ValueError("max_synthetic_to_original_ratio cannot be negative.")
+        augmented = frame.get(
+            "augmented", pd.Series(False, index=frame.index, dtype=bool)
+        )
+        if augmented.dtype != bool:
+            augmented = (
+                augmented.astype(str).str.strip().str.lower().map(
+                    {"true": True, "1": True, "false": False, "0": False}
+                )
+            ).fillna(False)
+        train_mask = frame["split"] == "train"
+        original_train = frame[train_mask & ~augmented]
+        synthetic_train = frame[train_mask & augmented]
+        maximum_synthetic = int(len(original_train) * synthetic_ratio)
+        retained_synthetic = synthetic_train
+        if len(synthetic_train) > maximum_synthetic:
+            retained_synthetic = synthetic_train.sample(
+                n=maximum_synthetic, random_state=seed
+            )
+            frame = pd.concat(
+                [frame[~(train_mask & augmented)], retained_synthetic],
+                ignore_index=True,
+            )
+        input_report["origin_balancing"] = {
+            "max_synthetic_to_original_ratio": synthetic_ratio,
+            "original_train_rows": len(original_train),
+            "synthetic_train_rows_before": len(synthetic_train),
+            "synthetic_train_rows_after": len(retained_synthetic),
+            "total_train_rows_after": int((frame["split"] == "train").sum()),
+        }
     input_report["augmentation_artifacts"] = augmentation_report
+    input_report["available_emotion_names"] = available_emotion_names
+    input_report["trained_emotion_names"] = emotion_names
     with (output / "source_input_report.json").open("w", encoding="utf-8") as handle:
         json.dump(input_report, handle, indent=2, sort_keys=True)
     train = frame[frame["split"] == "train"].copy()
@@ -496,6 +553,17 @@ def pretrain_source_mtl(
     task_weights = config["task_weights"]
     emotion_threshold = float(config.get("emotion_threshold", 0.4))
     history: list[dict[str, Any]] = []
+    selection_metric = config.get(
+        "checkpoint_selection", "emotion_intensity_macro_f1"
+    )
+    if selection_metric not in {"loss", "emotion_intensity_macro_f1"}:
+        raise ValueError(
+            "source_mtl.checkpoint_selection must be 'loss' or "
+            "'emotion_intensity_macro_f1'."
+        )
+    best_selection = (
+        float("inf") if selection_metric == "loss" else -float("inf")
+    )
     best_loss = float("inf")
     best_epoch = 0
     checkpoint_path = output / "source_transfer_checkpoint.pt"
@@ -594,7 +662,22 @@ def pretrain_source_mtl(
                 **history[-1],
             },
         )
-        if validation_metrics["loss"] < best_loss:
+        selection_value = (
+            validation_metrics["loss"]
+            if selection_metric == "loss"
+            else (
+                validation_metrics["emotion_f1_macro"]
+                + validation_metrics["intensity_f1_macro"]
+            )
+            / 2.0
+        )
+        improved = (
+            selection_value < best_selection
+            if selection_metric == "loss"
+            else selection_value > best_selection
+        )
+        if improved:
+            best_selection = selection_value
             best_loss = validation_metrics["loss"]
             best_epoch = epoch
             torch.save(
@@ -634,11 +717,13 @@ def pretrain_source_mtl(
             )
             tqdm.write(
                 f"[source seed {seed}] saved best checkpoint at epoch {best_epoch} "
-                f"(validation loss={best_loss:.4f})"
+                f"({selection_metric}={best_selection:.4f}; "
+                f"validation loss={best_loss:.4f})"
             )
         epoch_iterator.set_postfix(
             val_loss=f"{validation_metrics['loss']:.4f}",
             emotion_f1=f"{validation_metrics['emotion_f1_macro']:.4f}",
+            selection=f"{selection_value:.4f}",
             best_epoch=best_epoch or "-",
         )
         if epoch - best_epoch >= config["early_stopping_patience"]:
@@ -651,6 +736,8 @@ def pretrain_source_mtl(
         "seed": seed,
         "best_epoch": best_epoch,
         "best_validation_loss": best_loss,
+        "checkpoint_selection": selection_metric,
+        "best_selection_score": best_selection,
         "checkpoint": str(checkpoint_path),
         "split_hash": source_split_hash,
         "emotion_names": emotion_names,
@@ -1132,6 +1219,632 @@ def train_temporal_model(
             if transfer_checkpoint_path is not None
             else None
         ),
+        "source_checkpoint_sha256": source_checkpoint_hash,
+        "device": str(device),
+        "duration_seconds": time.time() - started_at,
+    }
+    with (output / "run_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    _append_progress(progress_path, {"event": "run_completed", **summary})
+    return summary
+
+
+def _ordinal_class_probabilities(logits: torch.Tensor) -> torch.Tensor:
+    cumulative = torch.sigmoid(logits)
+    probabilities = torch.cat(
+        [
+            1.0 - cumulative[:, :1],
+            cumulative[:, :-1] - cumulative[:, 1:],
+            cumulative[:, -1:],
+        ],
+        dim=1,
+    )
+    return probabilities.clamp_min(0.0) / probabilities.sum(
+        dim=1, keepdim=True
+    ).clamp_min(1e-8)
+
+
+def _multiclass_focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    class_weights: torch.Tensor | None,
+    gamma: float,
+) -> torch.Tensor:
+    """Class-balanced focal loss for one-indexed outcome labels."""
+    zero_indexed = targets.long() - 1
+    log_probabilities = nn.functional.log_softmax(logits, dim=-1)
+    probabilities = log_probabilities.exp()
+    target_log_probability = log_probabilities.gather(
+        1, zero_indexed.unsqueeze(1)
+    ).squeeze(1)
+    target_probability = probabilities.gather(
+        1, zero_indexed.unsqueeze(1)
+    ).squeeze(1)
+    loss = -(1.0 - target_probability).pow(gamma) * target_log_probability
+    if class_weights is not None:
+        loss = loss * class_weights[zero_indexed]
+    return loss.mean()
+
+
+def _structured_outcome_predictions(
+    final_logits: torch.Tensor,
+    drop_logits: torch.Tensor,
+    initial_intensity: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the highest-scoring valid pair satisfying final + drop = initial."""
+    final_scores = nn.functional.log_softmax(final_logits, dim=-1)
+    drop_scores = nn.functional.log_softmax(drop_logits, dim=-1)
+    joint_scores = final_scores.unsqueeze(2) + drop_scores.unsqueeze(1)
+    classes = torch.arange(1, 5, device=joint_scores.device)
+    valid = (
+        classes.view(1, 4, 1) + classes.view(1, 1, 4)
+        == initial_intensity.view(-1, 1, 1)
+    )
+    joint_scores = joint_scores.masked_fill(~valid, -torch.inf)
+    flat = joint_scores.flatten(1).argmax(dim=1)
+    predicted_final = flat.div(4, rounding_mode="floor") + 1
+    predicted_drop = flat.remainder(4) + 1
+    return predicted_final, predicted_drop
+
+
+def _run_outcome_ceiling_epoch(
+    model: EmotionConditionedOutcomeModel,
+    loader: DataLoader,
+    device: torch.device,
+    threshold_weights: torch.Tensor,
+    auxiliary_regression_weight: float = 0.0,
+    optimizer: AdamW | None = None,
+    scheduler: Any | None = None,
+    progress_description: str | None = None,
+    progress_position: int = 0,
+    final_class_weights: torch.Tensor | None = None,
+    drop_class_weights: torch.Tensor | None = None,
+    focal_gamma: float = 2.0,
+    direct_classification_weight: float = 1.0,
+    ordinal_auxiliary_weight: float = 0.2,
+    consistency_weight: float = 0.1,
+) -> tuple[dict[str, float], pd.DataFrame]:
+    training = optimizer is not None
+    model.train(training)
+    losses: list[float] = []
+    identifiers: list[str] = []
+    initial_values: list[int] = []
+    final_true: list[int] = []
+    final_pred: list[int] = []
+    drop_true: list[int] = []
+    drop_pred: list[int] = []
+    final_probabilities: list[list[float]] = []
+    drop_regression_values: list[float] = []
+    ordinal_losses: list[float] = []
+    auxiliary_losses: list[float] = []
+    final_classification_losses: list[float] = []
+    drop_classification_losses: list[float] = []
+    consistency_losses: list[float] = []
+    drop_probabilities: list[list[float]] = []
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        iterator = tqdm(
+            loader,
+            desc=progress_description,
+            unit="batch",
+            position=progress_position,
+            leave=False,
+            dynamic_ncols=True,
+            disable=progress_description is None,
+        )
+        for batch_index, raw_batch in enumerate(iterator, start=1):
+            identifiers.extend(raw_batch["conversation_id"])
+            batch = _move_tensors(raw_batch, device)
+            outputs = model(batch)
+            logits = outputs["final_ordinal_logits"]
+            targets = cumulative_ordinal_targets(batch["final_target"])
+            ordinal_loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, targets, pos_weight=threshold_weights
+            )
+            direct_outputs = "final_logits" in outputs and "drop_logits" in outputs
+            final_classification_loss = logits.new_zeros(())
+            drop_classification_loss = logits.new_zeros(())
+            consistency_loss = logits.new_zeros(())
+            if direct_outputs:
+                final_classification_loss = _multiclass_focal_loss(
+                    outputs["final_logits"],
+                    batch["final_target"],
+                    final_class_weights,
+                    focal_gamma,
+                )
+                drop_classification_loss = _multiclass_focal_loss(
+                    outputs["drop_logits"],
+                    batch["drop_target"],
+                    drop_class_weights,
+                    focal_gamma,
+                )
+                class_values = torch.arange(
+                    1, 5, device=logits.device, dtype=logits.dtype
+                )
+                expected_final = (
+                    outputs["final_logits"].softmax(dim=-1) * class_values
+                ).sum(dim=-1)
+                expected_drop = (
+                    outputs["drop_logits"].softmax(dim=-1) * class_values
+                ).sum(dim=-1)
+                consistency_loss = nn.functional.smooth_l1_loss(
+                    expected_final + expected_drop,
+                    batch["initial_intensity"].to(logits.dtype),
+                )
+                loss = direct_classification_weight * (
+                    final_classification_loss + drop_classification_loss
+                )
+                loss = loss + ordinal_auxiliary_weight * ordinal_loss
+                loss = loss + consistency_weight * consistency_loss
+            else:
+                loss = ordinal_loss
+            auxiliary_loss = logits.new_zeros(())
+            if auxiliary_regression_weight > 0:
+                if "drop_regression" not in outputs:
+                    raise ValueError(
+                        "Auxiliary regression weight requires a regression head."
+                    )
+                auxiliary_loss = nn.functional.smooth_l1_loss(
+                    outputs["drop_regression"], batch["drop_target"].float()
+                )
+                loss = loss + auxiliary_regression_weight * auxiliary_loss
+            if training:
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+            losses.append(float(loss.detach().cpu()))
+            ordinal_losses.append(float(ordinal_loss.detach().cpu()))
+            auxiliary_losses.append(float(auxiliary_loss.detach().cpu()))
+            final_classification_losses.append(
+                float(final_classification_loss.detach().cpu())
+            )
+            drop_classification_losses.append(
+                float(drop_classification_loss.detach().cpu())
+            )
+            consistency_losses.append(float(consistency_loss.detach().cpu()))
+            if batch_index == 1 or batch_index % 10 == 0 or batch_index == len(loader):
+                iterator.set_postfix(loss=f"{np.mean(losses):.4f}")
+            if direct_outputs:
+                predicted_final, predicted_drop = _structured_outcome_predictions(
+                    outputs["final_logits"],
+                    outputs["drop_logits"],
+                    batch["initial_intensity"],
+                )
+                final_probabilities.extend(
+                    outputs["final_logits"].softmax(dim=-1).detach().cpu().tolist()
+                )
+                drop_probabilities.extend(
+                    outputs["drop_logits"].softmax(dim=-1).detach().cpu().tolist()
+                )
+            else:
+                predicted_final = cumulative_ordinal_predictions(
+                    logits, batch["initial_intensity"]
+                )
+                predicted_drop = batch["initial_intensity"] - predicted_final
+                final_probabilities.extend(
+                    _ordinal_class_probabilities(logits).detach().cpu().tolist()
+                )
+            initial_values.extend(batch["initial_intensity"].detach().cpu().tolist())
+            final_true.extend(batch["final_target"].detach().cpu().tolist())
+            final_pred.extend(predicted_final.detach().cpu().tolist())
+            drop_true.extend(batch["drop_target"].detach().cpu().tolist())
+            drop_pred.extend(predicted_drop.detach().cpu().tolist())
+            if "drop_regression" in outputs:
+                drop_regression_values.extend(
+                    outputs["drop_regression"].detach().cpu().tolist()
+                )
+
+    final_metrics = classification_metrics(final_true, final_pred, labels=(1, 2, 3, 4))
+    final_metrics.update(ordinal_metrics(final_true, final_pred, labels=(1, 2, 3, 4)))
+    drop_metrics = classification_metrics(drop_true, drop_pred, labels=(1, 2, 3, 4))
+    drop_metrics.update(ordinal_metrics(drop_true, drop_pred, labels=(1, 2, 3, 4)))
+    metrics = {
+        "loss": float(np.mean(losses)),
+        "ordinal_loss": float(np.mean(ordinal_losses)),
+        "auxiliary_regression_loss": float(np.mean(auxiliary_losses)),
+        "final_classification_loss": float(np.mean(final_classification_losses)),
+        "drop_classification_loss": float(np.mean(drop_classification_losses)),
+        "consistency_loss": float(np.mean(consistency_losses)),
+    }
+    metrics.update({f"final_{key}": value for key, value in final_metrics.items()})
+    metrics.update({f"drop_{key}": value for key, value in drop_metrics.items()})
+    predictions = pd.DataFrame(
+        {
+            "conversation_id": identifiers,
+            "initial_intensity": initial_values,
+            "final_target": final_true,
+            "final_prediction": final_pred,
+            "drop_target": drop_true,
+            "drop_prediction": drop_pred,
+        }
+    )
+    for index in range(4):
+        predictions[f"final_probability_{index + 1}"] = np.asarray(
+            final_probabilities
+        )[:, index]
+        if drop_probabilities:
+            predictions[f"drop_probability_{index + 1}"] = np.asarray(
+                drop_probabilities
+            )[:, index]
+    if drop_regression_values:
+        predictions["drop_regression"] = drop_regression_values
+        metrics["drop_regression_mae"] = float(
+            np.mean(
+                np.abs(
+                    predictions["drop_regression"].to_numpy()
+                    - predictions["drop_target"].to_numpy()
+                )
+            )
+        )
+    metrics["joint_consistency_rate"] = float(
+        (
+            predictions["final_prediction"] + predictions["drop_prediction"]
+            == predictions["initial_intensity"]
+        ).mean()
+    )
+    metrics["invalid_derived_drop_rate"] = float(
+        (~predictions["drop_prediction"].between(1, 4)).mean()
+    )
+    return metrics, predictions
+
+
+def _outcome_parameter_groups(
+    model: EmotionConditionedOutcomeModel,
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build non-overlapping encoder/head groups for discriminative tuning."""
+    encoder_learning_rate = float(
+        config.get("encoder_learning_rate", config["learning_rate"])
+    )
+    head_learning_rate = float(
+        config.get("head_learning_rate", config["learning_rate"])
+    )
+    if encoder_learning_rate <= 0 or head_learning_rate <= 0:
+        raise ValueError("Outcome learning rates must be positive.")
+    encoder_parameters = list(model.text_encoder.parameters())
+    encoder_ids = {id(parameter) for parameter in encoder_parameters}
+    head_parameters = [
+        parameter for parameter in model.parameters() if id(parameter) not in encoder_ids
+    ]
+    return [
+        {"params": encoder_parameters, "lr": encoder_learning_rate},
+        {"params": head_parameters, "lr": head_learning_rate},
+    ]
+
+
+def _outcome_trainable_layers(
+    epoch: int,
+    config: dict[str, Any],
+) -> int | None:
+    """Return 0 (frozen), top-N, or None (fully trainable) for an epoch."""
+    freeze_epochs = int(config.get("freeze_text_encoder_epochs", 1))
+    if freeze_epochs < 0:
+        raise ValueError("freeze_text_encoder_epochs cannot be negative.")
+    if epoch <= freeze_epochs:
+        return 0
+    stages = [int(value) for value in config.get("gradual_unfreeze_layers", [])]
+    if any(value <= 0 for value in stages):
+        raise ValueError("gradual_unfreeze_layers must contain positive values.")
+    stage_index = epoch - freeze_epochs - 1
+    return stages[stage_index] if stage_index < len(stages) else None
+
+
+def train_outcome_ceiling_model(
+    checkpoints_path: str | Path,
+    output_dir: str | Path,
+    seed: int,
+    config: dict[str, Any],
+    transfer_checkpoint_path: str | Path | None = None,
+    progress_position: int = 0,
+) -> dict[str, Any]:
+    """Train the role-aware, metadata-conditioned 100% context ceiling."""
+    started_at = time.time()
+    set_seed(seed)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    frame = pd.read_csv(checkpoints_path)
+    subset = frame[np.isclose(frame["checkpoint"].astype(float), 1.0)].copy()
+    if subset.empty:
+        raise ValueError("The outcome ceiling experiment requires checkpoint 1.0.")
+    required = {"text_role_turns", "emotion_family", "problem_type"}
+    missing = required - set(subset.columns)
+    if missing:
+        raise ValueError(
+            "Preprocess ESConv again before training the outcome ceiling model; "
+            f"missing columns: {sorted(missing)}"
+        )
+    train = subset[subset["split"] == "train"].copy()
+    validation = subset[subset["split"] == "validation"].copy()
+    test = subset[subset["split"] == "test"].copy()
+    if any(part.empty for part in (train, validation, test)):
+        raise ValueError("Outcome ceiling training requires train/validation/test rows.")
+
+    emotion_vocabulary = categorical_vocabulary(train["emotion_family"].tolist())
+    problem_vocabulary = categorical_vocabulary(train["problem_type"].tolist())
+    device = resolve_device(config.get("device", "auto"))
+    tokenizer = AutoTokenizer.from_pretrained(config["transformer_name"])
+    dataset_arguments = {
+        "tokenizer": tokenizer,
+        "emotion_vocabulary": emotion_vocabulary,
+        "problem_vocabulary": problem_vocabulary,
+        "strategy_mode": config.get("strategy_mode", "quantity_timing_order"),
+        "max_length": config["max_length"],
+        "max_chunks": config["max_chunks"],
+    }
+    datasets = {
+        "train": OutcomeCeilingDataset(train, **dataset_arguments),
+        "validation": OutcomeCeilingDataset(validation, **dataset_arguments),
+        "test": OutcomeCeilingDataset(test, **dataset_arguments),
+    }
+    collate = partial(
+        outcome_ceiling_collate, pad_token_id=tokenizer.pad_token_id or 0
+    )
+    generator = torch.Generator().manual_seed(seed)
+    loaders = {
+        "train": DataLoader(
+            datasets["train"],
+            batch_size=config["batch_size"],
+            shuffle=True,
+            generator=generator,
+            collate_fn=collate,
+            num_workers=config.get("num_workers", 0),
+        ),
+        "validation": DataLoader(
+            datasets["validation"],
+            batch_size=config["batch_size"],
+            shuffle=False,
+            collate_fn=collate,
+            num_workers=config.get("num_workers", 0),
+        ),
+        "test": DataLoader(
+            datasets["test"],
+            batch_size=config["batch_size"],
+            shuffle=False,
+            collate_fn=collate,
+            num_workers=config.get("num_workers", 0),
+        ),
+    }
+    transfer_checkpoint = None
+    source_checkpoint_hash = None
+    if transfer_checkpoint_path is not None:
+        transfer_checkpoint = torch.load(
+            transfer_checkpoint_path, map_location="cpu", weights_only=False
+        )
+        source_checkpoint_hash = _file_hash(transfer_checkpoint_path)
+    model = EmotionConditionedOutcomeModel(
+        transformer_name=config["transformer_name"],
+        transfer_checkpoint=transfer_checkpoint,
+        emotion_vocabulary_size=len(emotion_vocabulary),
+        problem_vocabulary_size=len(problem_vocabulary),
+        dropout=config["dropout"],
+        max_chunks=config["max_chunks"],
+        metadata_size=config.get("metadata_size", 64),
+        strategy_vocabulary_size=len(strategy_vocabulary()),
+        strategy_numeric_size=len(
+            strategy_feature_columns(
+                config.get("strategy_mode", "quantity_timing_order")
+            )
+        ),
+        strategy_hidden_size=config.get("strategy_hidden_size", 256),
+        use_speaker_features=config.get("use_speaker_features", False),
+        use_trajectory=config.get("use_trajectory", False),
+        use_strategy=config.get("use_strategy", False),
+        use_auxiliary_regression=config.get("use_auxiliary_regression", True),
+    ).to(device)
+    auxiliary_regression_weight = float(
+        config.get("auxiliary_regression_weight", 0.0)
+    )
+    train_targets = cumulative_ordinal_targets(
+        torch.tensor(train["final_intensity"].to_numpy(), dtype=torch.long)
+    )
+    positive = train_targets.sum(dim=0)
+    negative = len(train_targets) - positive
+    threshold_weights = (negative / positive.clamp_min(1.0)).to(device)
+    final_class_weights = _class_weights(
+        train["final_intensity"], (1, 2, 3, 4), device
+    )
+    drop_class_weights = _class_weights(
+        train["drop_magnitude"], (1, 2, 3, 4), device
+    )
+    epoch_loss_kwargs = {
+        "final_class_weights": final_class_weights,
+        "drop_class_weights": drop_class_weights,
+        "focal_gamma": float(config.get("outcome_focal_gamma", 2.0)),
+        "direct_classification_weight": float(
+            config.get("direct_classification_weight", 1.0)
+        ),
+        "ordinal_auxiliary_weight": float(
+            config.get("ordinal_auxiliary_weight", 0.2)
+        ),
+        "consistency_weight": float(config.get("consistency_weight", 0.1)),
+    }
+    optimizer = AdamW(
+        _outcome_parameter_groups(model, config),
+        weight_decay=config["weight_decay"],
+    )
+    total_steps = max(len(loaders["train"]) * config["epochs"], 1)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_steps * config["warmup_ratio"]),
+        num_training_steps=total_steps,
+    )
+    freeze_epochs = int(config.get("freeze_text_encoder_epochs", 1))
+    best_score = -float("inf")
+    best_epoch = 0
+    model_path = output / "best_model.pt"
+    progress_path = output / "training_progress.jsonl"
+    history: list[dict[str, Any]] = []
+    run_config = {
+        "run_type": "outcome_ceiling",
+        "checkpoint": 1.0,
+        "seed": seed,
+        "transfer": transfer_checkpoint is not None,
+        "source_checkpoint": (
+            str(Path(transfer_checkpoint_path).resolve())
+            if transfer_checkpoint_path is not None
+            else None
+        ),
+        "source_checkpoint_sha256": source_checkpoint_hash,
+        "split_hash": _split_hash(subset),
+        "emotion_vocabulary": emotion_vocabulary,
+        "problem_vocabulary": problem_vocabulary,
+        "threshold_positive_weights": threshold_weights.detach().cpu().tolist(),
+        "final_class_weights": final_class_weights.detach().cpu().tolist(),
+        "drop_class_weights": drop_class_weights.detach().cpu().tolist(),
+        "architecture": config.get("architecture", "base"),
+        "config": config,
+    }
+    with (output / "run_config.json").open("w", encoding="utf-8") as handle:
+        json.dump(run_config, handle, indent=2, sort_keys=True)
+    _append_progress(progress_path, {"event": "run_started", **run_config})
+
+    epoch_iterator = tqdm(
+        range(1, config["epochs"] + 1),
+        desc=f"Outcome ceiling seed {seed}",
+        unit="epoch",
+        position=progress_position,
+        leave=True,
+        dynamic_ncols=True,
+    )
+    for epoch in epoch_iterator:
+        trainable_layers = _outcome_trainable_layers(epoch, config)
+        model.set_text_encoder_trainable_layers(trainable_layers)
+        epoch_started = time.time()
+        train_metrics, _ = _run_outcome_ceiling_epoch(
+            model,
+            loaders["train"],
+            device,
+            threshold_weights,
+            auxiliary_regression_weight,
+            optimizer,
+            scheduler,
+            progress_description=f"outcome epoch {epoch} train",
+            progress_position=progress_position + 1,
+            **epoch_loss_kwargs,
+        )
+        validation_metrics, _ = _run_outcome_ceiling_epoch(
+            model,
+            loaders["validation"],
+            device,
+            threshold_weights,
+            auxiliary_regression_weight,
+            progress_description=f"outcome epoch {epoch} validation",
+            progress_position=progress_position + 1,
+            **epoch_loss_kwargs,
+        )
+        score = (
+            validation_metrics["final_f1_macro"]
+            + validation_metrics["drop_f1_macro"]
+        ) / 2.0
+        history.append(
+            {
+                "epoch": epoch,
+                "text_encoder_frozen": epoch <= freeze_epochs,
+                "text_encoder_trainable_layers": trainable_layers,
+                "train": train_metrics,
+                "validation": validation_metrics,
+                "selection_score": score,
+                "encoder_learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "head_learning_rate": float(optimizer.param_groups[1]["lr"]),
+                "duration_seconds": time.time() - epoch_started,
+            }
+        )
+        _append_progress(progress_path, {"event": "epoch_completed", **history[-1]})
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch
+            torch.save(model.state_dict(), model_path)
+        epoch_iterator.set_postfix(
+            val_f1=f"{score:.4f}", best_epoch=best_epoch or "-"
+        )
+        if epoch - best_epoch >= config["early_stopping_patience"]:
+            break
+
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    metric_rows: list[dict[str, Any]] = []
+    for split_name in ("validation", "test"):
+        metrics, predictions = _run_outcome_ceiling_epoch(
+            model,
+            loaders[split_name],
+            device,
+            threshold_weights,
+            auxiliary_regression_weight,
+            progress_description=f"outcome final {split_name}",
+            progress_position=progress_position + 1,
+            **epoch_loss_kwargs,
+        )
+        predictions["split"] = split_name
+        predictions["seed"] = seed
+        predictions["transfer"] = transfer_checkpoint is not None
+        predictions["architecture"] = config.get("architecture", "base")
+        predictions.to_csv(output / f"{split_name}_predictions.csv", index=False)
+        diagnostic_rows: list[dict[str, Any]] = []
+        confusion_rows: list[dict[str, Any]] = []
+        for target, prefix in (
+            ("final_intensity", "final"),
+            ("drop_magnitude", "drop"),
+        ):
+            truth = predictions[f"{prefix}_target"]
+            predicted = predictions[f"{prefix}_prediction"]
+            diagnostic_rows.extend(
+                {"target": target, **row}
+                for row in per_class_metrics(
+                    truth, predicted, labels=(1, 2, 3, 4), label_names=("1", "2", "3", "4")
+                )
+            )
+            confusion_rows.extend(
+                {"target": target, **row}
+                for row in confusion_matrix_records(
+                    truth, predicted, labels=(1, 2, 3, 4)
+                )
+            )
+            metric_rows.append(
+                {
+                    "checkpoint": 1.0,
+                    "checkpoint_percent": 100,
+                    "split": split_name,
+                    "target": target,
+                    "model": (
+                        "emotion_conditioned_ordinal_"
+                        f"{config.get('architecture', 'base')}"
+                    ),
+                    "transfer": transfer_checkpoint is not None,
+                    "seed": seed,
+                    **{
+                        key.removeprefix(f"{prefix}_"): value
+                        for key, value in metrics.items()
+                        if key.startswith(f"{prefix}_")
+                    },
+                    "joint_consistency_rate": metrics["joint_consistency_rate"],
+                    "invalid_derived_drop_rate": metrics[
+                        "invalid_derived_drop_rate"
+                    ],
+                }
+            )
+        pd.DataFrame(diagnostic_rows).to_csv(
+            output / f"{split_name}_per_class_metrics.csv", index=False
+        )
+        pd.DataFrame(confusion_rows).to_csv(
+            output / f"{split_name}_confusion_matrices.csv", index=False
+        )
+    pd.DataFrame(metric_rows).to_csv(output / "metrics.csv", index=False)
+    with (output / "training_history.json").open("w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=2)
+    summary = {
+        "checkpoint": 1.0,
+        "model": (
+            "emotion_conditioned_ordinal_"
+            f"{config.get('architecture', 'base')}"
+        ),
+        "transfer": transfer_checkpoint is not None,
+        "seed": seed,
+        "best_epoch": best_epoch,
+        "best_selection_score": best_score,
+        "split_hash": _split_hash(subset),
+        "source_checkpoint": run_config["source_checkpoint"],
         "source_checkpoint_sha256": source_checkpoint_hash,
         "device": str(device),
         "duration_seconds": time.time() - started_at,

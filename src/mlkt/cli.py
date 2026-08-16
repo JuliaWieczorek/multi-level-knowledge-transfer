@@ -133,6 +133,36 @@ def baseline(args: argparse.Namespace) -> None:
     print(f"Wrote predictions to {predictions_path}")
 
 
+def outcome_baselines(args: argparse.Namespace) -> None:
+    from .baseline import run_outcome_metadata_baselines
+
+    config_path = Path(args.config).resolve()
+    config = _load_config(config_path)
+    input_path = Path(
+        args.input
+        or _resolve_config_path(
+            config["outcome_ceiling"]["checkpoints_path"], config_path
+        )
+    )
+    frame = pd.read_csv(input_path)
+    metrics, predictions = run_outcome_metadata_baselines(
+        frame, checkpoint=1.0, seed=args.seed
+    )
+    output_dir = Path(
+        args.output_dir
+        or _config_output_path(config["outcome_ceiling"]["output_dir"], config_path)
+        / "baselines"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "metadata_metrics.csv"
+    predictions_path = output_dir / "metadata_predictions.csv"
+    metrics.to_csv(metrics_path, index=False)
+    predictions.to_csv(predictions_path, index=False)
+    print(metrics.to_string(index=False))
+    print(f"\nWrote metrics to {metrics_path}")
+    print(f"Wrote predictions to {predictions_path}")
+
+
 def prepare_transfer(args: argparse.Namespace) -> None:
     from .transfer import prepare_transfer_inputs
 
@@ -218,7 +248,11 @@ def pretrain_transfer(args: argparse.Namespace) -> None:
     config_path = Path(args.config).resolve()
     config = _load_config(config_path)
     transfer = config["transfer"]
-    source_config = config["source_mtl"]
+    source_config = (
+        config["source_aligned_mtl"]
+        if args.aligned_negative
+        else config["source_mtl"]
+    )
     source_path = (
         Path(args.input)
         if args.input
@@ -323,6 +357,61 @@ def train_temporal(args: argparse.Namespace) -> None:
         config=temporal,
         transfer_checkpoint_path=transfer_checkpoint,
         use_initial_intensity=args.use_initial_intensity,
+    )
+    print(json.dumps(summary, indent=2))
+
+
+def train_outcome_ceiling(args: argparse.Namespace) -> None:
+    from .training import train_outcome_ceiling_model
+
+    config_path = Path(args.config).resolve()
+    config = _load_config(config_path)
+    ceiling_config = dict(config["outcome_ceiling"])
+    architecture_features = {
+        "base": (False, False, False),
+        "speaker": (True, False, False),
+        "trajectory": (True, True, False),
+        "strategies": (False, False, True),
+        "full": (True, True, True),
+    }
+    speaker, trajectory, strategy = architecture_features[args.architecture]
+    ceiling_config.update(
+        {
+            "architecture": args.architecture,
+            "use_speaker_features": speaker,
+            "use_trajectory": trajectory,
+            "use_strategy": strategy,
+        }
+    )
+    transfer_checkpoint = args.source_checkpoint
+    if args.transfer and not transfer_checkpoint:
+        source_root = _config_output_path(
+            ceiling_config["source_output_dir"], config_path
+        )
+        transfer_checkpoint = (
+            source_root / f"seed_{args.seed}" / "source_transfer_checkpoint.pt"
+        )
+    if not args.transfer:
+        transfer_checkpoint = None
+    transfer_variant = (
+        "transferred" if transfer_checkpoint is not None else "vanilla"
+    )
+    output_dir = Path(
+        args.output_dir
+        or _config_output_path(ceiling_config["output_dir"], config_path)
+        / f"seed_{args.seed}"
+        / args.architecture
+        / transfer_variant
+    )
+    summary = train_outcome_ceiling_model(
+        checkpoints_path=args.input
+        or _resolve_config_path(
+            ceiling_config["checkpoints_path"], config_path
+        ),
+        output_dir=output_dir,
+        seed=args.seed,
+        config=ceiling_config,
+        transfer_checkpoint_path=transfer_checkpoint,
     )
     print(json.dumps(summary, indent=2))
 
@@ -437,6 +526,13 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_parser.add_argument("--seed", type=int, default=42)
     baseline_parser.set_defaults(function=baseline)
 
+    outcome_baseline_parser = subparsers.add_parser("outcome-baselines")
+    outcome_baseline_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    outcome_baseline_parser.add_argument("--input")
+    outcome_baseline_parser.add_argument("--output-dir")
+    outcome_baseline_parser.add_argument("--seed", type=int, default=42)
+    outcome_baseline_parser.set_defaults(function=outcome_baselines)
+
     transfer_parser = subparsers.add_parser("prepare-transfer")
     transfer_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     transfer_parser.add_argument("--esconv-da")
@@ -463,6 +559,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_parser.add_argument("--input")
     source_parser.add_argument("--output-dir")
     source_parser.add_argument("--seed", type=int)
+    source_parser.add_argument("--aligned-negative", action="store_true")
     source_parser.set_defaults(function=pretrain_transfer)
 
     source_preflight_parser = subparsers.add_parser("preflight-source")
@@ -490,6 +587,22 @@ def build_parser() -> argparse.ArgumentParser:
     temporal_parser.add_argument("--source-checkpoint")
     temporal_parser.add_argument("--use-initial-intensity", action="store_true")
     temporal_parser.set_defaults(function=train_temporal)
+
+    outcome_parser = subparsers.add_parser("train-outcome-ceiling")
+    outcome_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    outcome_parser.add_argument("--input")
+    outcome_parser.add_argument("--output-dir")
+    outcome_parser.add_argument("--seed", type=int, default=42)
+    outcome_transfer = outcome_parser.add_mutually_exclusive_group()
+    outcome_transfer.add_argument("--transfer", action="store_true")
+    outcome_transfer.add_argument("--vanilla", action="store_true")
+    outcome_parser.add_argument("--source-checkpoint")
+    outcome_parser.add_argument(
+        "--architecture",
+        choices=("base", "speaker", "trajectory", "strategies", "full"),
+        default="full",
+    )
+    outcome_parser.set_defaults(function=train_outcome_ceiling)
 
     matrix_parser = subparsers.add_parser("run-matrix")
     matrix_parser.add_argument("--config", default=str(DEFAULT_CONFIG))

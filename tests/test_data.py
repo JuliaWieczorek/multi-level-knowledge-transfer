@@ -7,6 +7,7 @@ from mlkt.data import (
     assert_checkpoint_integrity,
     build_esconv_checkpoints,
     build_meisd_checkpoints,
+    negative_emotion_family,
 )
 from mlkt.splits import assign_conversation_splits, assert_no_split_leakage
 
@@ -56,6 +57,11 @@ class DataPipelineTests(unittest.TestCase):
             json.loads(frame.iloc[-1]["text_seeker_turns"]),
             ["one", "three"],
         )
+        self.assertEqual(
+            json.loads(frame.iloc[-1]["text_role_turns"]),
+            ["seeker: one", "supporter: two", "seeker: three", "supporter: four"],
+        )
+        self.assertEqual(set(frame["emotion_family"]), {"fear"})
         halfway = frame[frame["checkpoint"] == 0.5].iloc[0]
         self.assertEqual(halfway["strategy_sequence"], "Question")
         self.assertEqual(
@@ -66,6 +72,13 @@ class DataPipelineTests(unittest.TestCase):
         assert_checkpoint_integrity(
             frame, checkpoints=(0.25, 0.50, 1.00)
         )
+
+    def test_negative_emotion_taxonomy_matches_source_families(self):
+        self.assertEqual(negative_emotion_family("anxiety"), "fear")
+        self.assertEqual(negative_emotion_family("depression"), "sadness")
+        self.assertEqual(negative_emotion_family("jealousy"), "anger")
+        self.assertEqual(negative_emotion_family("disgust"), "disgust")
+        self.assertEqual(negative_emotion_family("unknown"), "other")
 
     def test_meisd_scalar_targets_and_three_change_classes(self):
         rows = []
