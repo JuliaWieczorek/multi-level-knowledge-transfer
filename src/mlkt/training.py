@@ -31,6 +31,7 @@ from .metrics import (
 from .models import (
     BinaryFocalLoss,
     EmotionConditionedOutcomeModel,
+    OUTCOME_PAIRS,
     SoftSharingMTL,
     TemporalMultiModalModel,
     cumulative_ordinal_predictions,
@@ -45,6 +46,7 @@ from .neural_data import (
     outcome_ceiling_collate,
     temporal_collate,
 )
+from .outcome_augmentation import validate_outcome_augmentation_frame
 from .strategy import strategy_feature_columns, strategy_vocabulary
 from .validation import validate_augmentation_artifacts, validate_source_training_frame
 
@@ -1327,6 +1329,62 @@ def _structured_outcome_predictions(
     return predicted_final, predicted_drop
 
 
+def _outcome_pair_targets(
+    final_targets: torch.Tensor, drop_targets: torch.Tensor
+) -> torch.Tensor:
+    """Encode valid one-indexed final/drop pairs as one-indexed joint classes."""
+    pairs = torch.tensor(OUTCOME_PAIRS, device=final_targets.device)
+    observed = torch.stack([final_targets, drop_targets], dim=1)
+    matches = (observed.unsqueeze(1) == pairs.unsqueeze(0)).all(dim=2)
+    if not bool(matches.any(dim=1).all()):
+        invalid = observed[~matches.any(dim=1)].detach().cpu().tolist()
+        raise ValueError(f"Unsupported outcome pairs: {invalid}")
+    return matches.to(torch.long).argmax(dim=1) + 1
+
+
+def _joint_pair_predictions(
+    joint_logits: torch.Tensor,
+    initial_intensity: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Decode the direct joint head after masking pairs invalid for the initial level."""
+    pairs = torch.tensor(
+        OUTCOME_PAIRS, device=joint_logits.device, dtype=initial_intensity.dtype
+    )
+    valid = pairs.sum(dim=1).unsqueeze(0) == initial_intensity.unsqueeze(1)
+    if not bool(valid.any(dim=1).all()):
+        invalid = initial_intensity[~valid.any(dim=1)].detach().cpu().tolist()
+        raise ValueError(f"Initial intensities have no valid outcome pair: {invalid}")
+    masked_logits = joint_logits.masked_fill(~valid, -torch.inf)
+    probabilities = masked_logits.softmax(dim=-1)
+    predicted_pair = probabilities.argmax(dim=1)
+    return (
+        pairs[predicted_pair, 0],
+        pairs[predicted_pair, 1],
+        probabilities,
+    )
+
+
+def _joint_marginal_probabilities(
+    joint_probabilities: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Marginalise the ten valid pair probabilities into four-class outcomes."""
+    pairs = torch.tensor(OUTCOME_PAIRS, device=joint_probabilities.device)
+    batch_size = joint_probabilities.shape[0]
+    final = joint_probabilities.new_zeros((batch_size, 4))
+    drop = joint_probabilities.new_zeros((batch_size, 4))
+    final.scatter_add_(
+        1,
+        (pairs[:, 0] - 1).unsqueeze(0).expand(batch_size, -1),
+        joint_probabilities,
+    )
+    drop.scatter_add_(
+        1,
+        (pairs[:, 1] - 1).unsqueeze(0).expand(batch_size, -1),
+        joint_probabilities,
+    )
+    return final, drop
+
+
 def _run_outcome_ceiling_epoch(
     model: EmotionConditionedOutcomeModel,
     loader: DataLoader,
@@ -1339,7 +1397,10 @@ def _run_outcome_ceiling_epoch(
     progress_position: int = 0,
     final_class_weights: torch.Tensor | None = None,
     drop_class_weights: torch.Tensor | None = None,
+    joint_class_weights: torch.Tensor | None = None,
     focal_gamma: float = 2.0,
+    joint_classification_weight: float = 1.0,
+    marginal_auxiliary_weight: float = 0.3,
     direct_classification_weight: float = 1.0,
     ordinal_auxiliary_weight: float = 0.2,
     consistency_weight: float = 0.1,
@@ -1360,7 +1421,9 @@ def _run_outcome_ceiling_epoch(
     final_classification_losses: list[float] = []
     drop_classification_losses: list[float] = []
     consistency_losses: list[float] = []
+    joint_classification_losses: list[float] = []
     drop_probabilities: list[list[float]] = []
+    joint_probabilities: list[list[float]] = []
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         iterator = tqdm(
@@ -1384,6 +1447,7 @@ def _run_outcome_ceiling_epoch(
             direct_outputs = "final_logits" in outputs and "drop_logits" in outputs
             final_classification_loss = logits.new_zeros(())
             drop_classification_loss = logits.new_zeros(())
+            joint_classification_loss = logits.new_zeros(())
             consistency_loss = logits.new_zeros(())
             if direct_outputs:
                 final_classification_loss = _multiclass_focal_loss(
@@ -1411,9 +1475,23 @@ def _run_outcome_ceiling_epoch(
                     expected_final + expected_drop,
                     batch["initial_intensity"].to(logits.dtype),
                 )
-                loss = direct_classification_weight * (
-                    final_classification_loss + drop_classification_loss
-                )
+                marginal_loss = final_classification_loss + drop_classification_loss
+                if "joint_pair_logits" in outputs:
+                    joint_targets = _outcome_pair_targets(
+                        batch["final_target"], batch["drop_target"]
+                    )
+                    joint_classification_loss = _multiclass_focal_loss(
+                        outputs["joint_pair_logits"],
+                        joint_targets,
+                        joint_class_weights,
+                        focal_gamma,
+                    )
+                    loss = (
+                        joint_classification_weight * joint_classification_loss
+                        + marginal_auxiliary_weight * marginal_loss
+                    )
+                else:
+                    loss = direct_classification_weight * marginal_loss
                 loss = loss + ordinal_auxiliary_weight * ordinal_loss
                 loss = loss + consistency_weight * consistency_loss
             else:
@@ -1445,20 +1523,43 @@ def _run_outcome_ceiling_epoch(
                 float(drop_classification_loss.detach().cpu())
             )
             consistency_losses.append(float(consistency_loss.detach().cpu()))
+            joint_classification_losses.append(
+                float(joint_classification_loss.detach().cpu())
+            )
             if batch_index == 1 or batch_index % 10 == 0 or batch_index == len(loader):
                 iterator.set_postfix(loss=f"{np.mean(losses):.4f}")
             if direct_outputs:
-                predicted_final, predicted_drop = _structured_outcome_predictions(
-                    outputs["final_logits"],
-                    outputs["drop_logits"],
-                    batch["initial_intensity"],
-                )
-                final_probabilities.extend(
-                    outputs["final_logits"].softmax(dim=-1).detach().cpu().tolist()
-                )
-                drop_probabilities.extend(
-                    outputs["drop_logits"].softmax(dim=-1).detach().cpu().tolist()
-                )
+                if "joint_pair_logits" in outputs:
+                    predicted_final, predicted_drop, pair_probability = (
+                        _joint_pair_predictions(
+                            outputs["joint_pair_logits"],
+                            batch["initial_intensity"],
+                        )
+                    )
+                    final_probability, drop_probability = (
+                        _joint_marginal_probabilities(pair_probability)
+                    )
+                    joint_probabilities.extend(
+                        pair_probability.detach().cpu().tolist()
+                    )
+                    final_probabilities.extend(
+                        final_probability.detach().cpu().tolist()
+                    )
+                    drop_probabilities.extend(
+                        drop_probability.detach().cpu().tolist()
+                    )
+                else:
+                    predicted_final, predicted_drop = _structured_outcome_predictions(
+                        outputs["final_logits"],
+                        outputs["drop_logits"],
+                        batch["initial_intensity"],
+                    )
+                    final_probabilities.extend(
+                        outputs["final_logits"].softmax(dim=-1).detach().cpu().tolist()
+                    )
+                    drop_probabilities.extend(
+                        outputs["drop_logits"].softmax(dim=-1).detach().cpu().tolist()
+                    )
             else:
                 predicted_final = cumulative_ordinal_predictions(
                     logits, batch["initial_intensity"]
@@ -1487,6 +1588,7 @@ def _run_outcome_ceiling_epoch(
         "auxiliary_regression_loss": float(np.mean(auxiliary_losses)),
         "final_classification_loss": float(np.mean(final_classification_losses)),
         "drop_classification_loss": float(np.mean(drop_classification_losses)),
+        "joint_classification_loss": float(np.mean(joint_classification_losses)),
         "consistency_loss": float(np.mean(consistency_losses)),
     }
     metrics.update({f"final_{key}": value for key, value in final_metrics.items()})
@@ -1509,6 +1611,11 @@ def _run_outcome_ceiling_epoch(
             predictions[f"drop_probability_{index + 1}"] = np.asarray(
                 drop_probabilities
             )[:, index]
+    for index, (final_value, drop_value) in enumerate(OUTCOME_PAIRS):
+        if joint_probabilities:
+            predictions[
+                f"joint_probability_final_{final_value}_drop_{drop_value}"
+            ] = np.asarray(joint_probabilities)[:, index]
     if drop_regression_values:
         predictions["drop_regression"] = drop_regression_values
         metrics["drop_regression_mae"] = float(
@@ -1586,6 +1693,7 @@ def train_outcome_ceiling_model(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     frame = pd.read_csv(checkpoints_path)
+    outcome_augmentation_report = validate_outcome_augmentation_frame(frame)
     subset = frame[np.isclose(frame["checkpoint"].astype(float), 1.0)].copy()
     if subset.empty:
         raise ValueError("The outcome ceiling experiment requires checkpoint 1.0.")
@@ -1691,6 +1799,10 @@ def train_outcome_ceiling_model(
         use_trajectory=config.get("use_trajectory", False),
         use_strategy=config.get("use_strategy", False),
         use_auxiliary_regression=config.get("use_auxiliary_regression", True),
+        use_joint_pair_head=config.get("use_joint_pair_head", True),
+        use_emotion_conditioned_heads=config.get(
+            "use_emotion_conditioned_heads", True
+        ),
     ).to(device)
     auxiliary_regression_weight = float(
         config.get("auxiliary_regression_weight", 0.0)
@@ -1707,10 +1819,24 @@ def train_outcome_ceiling_model(
     drop_class_weights = _class_weights(
         train["drop_magnitude"], (1, 2, 3, 4), device
     )
+    joint_targets = [
+        OUTCOME_PAIRS.index((int(final), int(drop))) + 1
+        for final, drop in zip(train["final_intensity"], train["drop_magnitude"])
+    ]
+    joint_class_weights = _class_weights(
+        joint_targets, tuple(range(1, len(OUTCOME_PAIRS) + 1)), device
+    )
     epoch_loss_kwargs = {
         "final_class_weights": final_class_weights,
         "drop_class_weights": drop_class_weights,
+        "joint_class_weights": joint_class_weights,
         "focal_gamma": float(config.get("outcome_focal_gamma", 2.0)),
+        "joint_classification_weight": float(
+            config.get("joint_classification_weight", 1.0)
+        ),
+        "marginal_auxiliary_weight": float(
+            config.get("marginal_auxiliary_weight", 0.3)
+        ),
         "direct_classification_weight": float(
             config.get("direct_classification_weight", 1.0)
         ),
@@ -1752,6 +1878,8 @@ def train_outcome_ceiling_model(
         "threshold_positive_weights": threshold_weights.detach().cpu().tolist(),
         "final_class_weights": final_class_weights.detach().cpu().tolist(),
         "drop_class_weights": drop_class_weights.detach().cpu().tolist(),
+        "joint_pairs": [list(pair) for pair in OUTCOME_PAIRS],
+        "joint_class_weights": joint_class_weights.detach().cpu().tolist(),
         "outcome_sampling_strategy": sampling_strategy,
         "sampling_weight_summary": (
             {
@@ -1763,6 +1891,7 @@ def train_outcome_ceiling_model(
             else None
         ),
         "architecture": config.get("architecture", "base"),
+        "outcome_augmentation": outcome_augmentation_report,
         "config": config,
     }
     with (output / "run_config.json").open("w", encoding="utf-8") as handle:
@@ -1881,7 +2010,8 @@ def train_outcome_ceiling_model(
                     "split": split_name,
                     "target": target,
                     "model": (
-                        "emotion_conditioned_ordinal_"
+                        f"{'emotion_conditioned' if config.get('use_emotion_conditioned_heads', True) else 'shared'}_"
+                        f"{'joint' if config.get('use_joint_pair_head', True) else 'factorized'}_"
                         f"{config.get('architecture', 'base')}"
                     ),
                     "transfer": transfer_checkpoint is not None,
@@ -1909,7 +2039,8 @@ def train_outcome_ceiling_model(
     summary = {
         "checkpoint": 1.0,
         "model": (
-            "emotion_conditioned_ordinal_"
+            f"{'emotion_conditioned' if config.get('use_emotion_conditioned_heads', True) else 'shared'}_"
+            f"{'joint' if config.get('use_joint_pair_head', True) else 'factorized'}_"
             f"{config.get('architecture', 'base')}"
         ),
         "transfer": transfer_checkpoint is not None,

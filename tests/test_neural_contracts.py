@@ -178,6 +178,7 @@ class NeuralContractTests(unittest.TestCase):
         )
         self.assertEqual(output["final_logits"].shape, (2, 4))
         self.assertEqual(output["drop_logits"].shape, (2, 4))
+        self.assertEqual(output["joint_pair_logits"].shape, (2, 10))
         self.assertEqual(output["final_ordinal_logits"].shape, (2, 3))
 
     def test_full_outcome_model_fuses_trajectory_and_strategies(self):
@@ -292,6 +293,40 @@ class NeuralContractTests(unittest.TestCase):
         self.assertEqual(final.tolist(), [3, 1])
         self.assertEqual(drop.tolist(), [2, 2])
         self.assertTrue(torch.equal(final + drop, initial))
+
+    def test_direct_joint_decoder_masks_invalid_pairs_and_marginalises(self):
+        import torch
+
+        from mlkt.training import (
+            _joint_marginal_probabilities,
+            _joint_pair_predictions,
+            _outcome_pair_targets,
+        )
+
+        targets = _outcome_pair_targets(
+            torch.tensor([1, 4, 2]), torch.tensor([4, 1, 2])
+        )
+        self.assertEqual(targets.tolist(), [4, 10, 6])
+
+        logits = torch.zeros((2, 10))
+        logits[0, 9] = 100.0  # (4, 1) is invalid when initial intensity is 3.
+        logits[0, 4] = 10.0   # (2, 1) is valid.
+        logits[1, 3] = 10.0   # (1, 4) is valid when initial intensity is 5.
+        final, drop, probabilities = _joint_pair_predictions(
+            logits, torch.tensor([3, 5])
+        )
+        self.assertEqual(final.tolist(), [2, 1])
+        self.assertEqual(drop.tolist(), [1, 4])
+        self.assertTrue(torch.equal(final + drop, torch.tensor([3, 5])))
+        final_probability, drop_probability = _joint_marginal_probabilities(
+            probabilities
+        )
+        self.assertTrue(
+            torch.allclose(final_probability.sum(dim=1), torch.ones(2))
+        )
+        self.assertTrue(
+            torch.allclose(drop_probability.sum(dim=1), torch.ones(2))
+        )
 
     def test_outcome_discriminative_learning_rates_do_not_overlap(self):
         import torch

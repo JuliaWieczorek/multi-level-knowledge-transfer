@@ -128,8 +128,12 @@
     "use_trajectory": true,
     "use_strategy": true,
     "use_auxiliary_regression": true,
+    "use_joint_pair_head": true,
+    "use_emotion_conditioned_heads": true,
     "auxiliary_regression_weight": 0.2,
     "outcome_focal_gamma": 2.0,
+    "joint_classification_weight": 1.0,
+    "marginal_auxiliary_weight": 0.3,
     "direct_classification_weight": 1.0,
     "ordinal_auxiliary_weight": 0.2,
     "consistency_weight": 0.1,
@@ -143,6 +147,18 @@
     "num_workers": 0,
     "device": "auto",
     "output_dir": "../outputs/outcome_ceiling"
+  },
+  "outcome_augmentation": {
+    "input_path": "../data/processed/outcome_ceiling/esconv_checkpoints.csv",
+    "output_dir": "../data/processed/outcome_augmentation/full_50pct",
+    "fraction": 0.5,
+    "context_size": 4096,
+    "threads": 8,
+    "gpu_layers": -1,
+    "batch_size": 1024,
+    "checkpoint_every": 10,
+    "max_prompt_words": 180,
+    "max_tokens": 640
   },
   "strategy_analysis": {
     "bootstrap_samples": 1000,

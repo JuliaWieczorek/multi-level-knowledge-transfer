@@ -241,6 +241,82 @@ def augment_transfer(args: argparse.Namespace) -> None:
     print(json.dumps(manifest, indent=2))
 
 
+def augment_outcomes(args: argparse.Namespace) -> None:
+    from .outcome_augmentation import (
+        DeterministicOutcomeMockGenerator,
+        run_outcome_augmentation,
+    )
+    from .transfer import LlamaCppGenerator
+
+    config_path = Path(args.config).resolve()
+    config = _load_config(config_path)
+    augmentation = config["outcome_augmentation"]
+    generator = None
+    if not args.plan_only:
+        if args.mock_generator:
+            if args.require_gpu:
+                raise ValueError("--require-gpu cannot be used with a mock generator.")
+            generator = DeterministicOutcomeMockGenerator()
+        else:
+            if not args.llama_model:
+                raise ValueError(
+                    "--llama-model is required unless --plan-only or "
+                    "--mock-generator is used."
+                )
+            generator = LlamaCppGenerator(
+                args.llama_model,
+                context_size=augmentation.get("context_size", 4096),
+                threads=augmentation.get("threads", 8),
+                gpu_layers=(
+                    args.gpu_layers
+                    if args.gpu_layers is not None
+                    else augmentation.get("gpu_layers", -1)
+                ),
+                batch_size=(
+                    args.batch_size
+                    if args.batch_size is not None
+                    else augmentation.get("batch_size", 1024)
+                ),
+                require_gpu=args.require_gpu,
+            )
+    focus_pairs = None
+    if args.focus_pair:
+        focus_pairs = []
+        for value in args.focus_pair:
+            try:
+                final_value, drop_value = (int(item) for item in value.split(","))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "--focus-pair must use FINAL,DROP notation, for example 4,1."
+                ) from error
+            focus_pairs.append((final_value, drop_value))
+    manifest = run_outcome_augmentation(
+        input_path=args.input
+        or _resolve_config_path(augmentation["input_path"], config_path),
+        output_dir=args.output_dir
+        or _config_output_path(augmentation["output_dir"], config_path),
+        generator=generator,
+        fraction=(
+            args.fraction
+            if args.fraction is not None
+            else augmentation.get("fraction", 0.5)
+        ),
+        seed=config["seed"],
+        max_conversations=args.max_conversations,
+        focus_pairs=focus_pairs,
+        max_prompt_words=augmentation.get("max_prompt_words", 180),
+        max_tokens=augmentation.get("max_tokens", 640),
+        checkpoint_every=(
+            args.checkpoint_every
+            if args.checkpoint_every is not None
+            else augmentation.get("checkpoint_every", 10)
+        ),
+        resume=args.resume,
+        plan_only=args.plan_only,
+    )
+    print(json.dumps(manifest, indent=2))
+
+
 def pretrain_transfer(args: argparse.Namespace) -> None:
     from .training import pretrain_source_mtl
     from tqdm.auto import tqdm
@@ -388,6 +464,8 @@ def train_outcome_ceiling(args: argparse.Namespace) -> None:
         "joint_sampling_power",
         "joint_sampling_max_ratio",
         "outcome_focal_gamma",
+        "joint_classification_weight",
+        "marginal_auxiliary_weight",
         "ordinal_auxiliary_weight",
         "consistency_weight",
         "auxiliary_regression_weight",
@@ -396,6 +474,10 @@ def train_outcome_ceiling(args: argparse.Namespace) -> None:
         value = getattr(args, name, None)
         if value is not None:
             ceiling_config[name] = value
+    if args.no_joint_pair_head:
+        ceiling_config["use_joint_pair_head"] = False
+    if args.no_emotion_conditioned_heads:
+        ceiling_config["use_emotion_conditioned_heads"] = False
     if args.validation_only:
         ceiling_config["evaluate_test"] = False
     transfer_checkpoint = args.source_checkpoint
@@ -588,6 +670,27 @@ def build_parser() -> argparse.ArgumentParser:
     augment_parser.add_argument("--benchmark", type=int, metavar="N")
     augment_parser.set_defaults(function=augment_transfer)
 
+    outcome_augment_parser = subparsers.add_parser("augment-outcomes")
+    outcome_augment_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    outcome_augment_parser.add_argument("--input")
+    outcome_augment_parser.add_argument("--output-dir")
+    outcome_augment_parser.add_argument("--llama-model")
+    outcome_augment_parser.add_argument("--mock-generator", action="store_true")
+    outcome_augment_parser.add_argument("--plan-only", action="store_true")
+    outcome_augment_parser.add_argument("--fraction", type=float)
+    outcome_augment_parser.add_argument("--max-conversations", type=int)
+    outcome_augment_parser.add_argument(
+        "--focus-pair",
+        action="append",
+        help="Prioritise a FINAL,DROP pair; repeat for multiple pairs.",
+    )
+    outcome_augment_parser.add_argument("--gpu-layers", type=int)
+    outcome_augment_parser.add_argument("--batch-size", type=int)
+    outcome_augment_parser.add_argument("--checkpoint-every", type=int)
+    outcome_augment_parser.add_argument("--resume", action="store_true")
+    outcome_augment_parser.add_argument("--require-gpu", action="store_true")
+    outcome_augment_parser.set_defaults(function=augment_outcomes)
+
     source_parser = subparsers.add_parser("pretrain-transfer")
     source_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     source_parser.add_argument("--input")
@@ -639,6 +742,12 @@ def build_parser() -> argparse.ArgumentParser:
     outcome_parser.add_argument("--joint-sampling-power", type=float)
     outcome_parser.add_argument("--joint-sampling-max-ratio", type=float)
     outcome_parser.add_argument("--outcome-focal-gamma", type=float)
+    outcome_parser.add_argument("--joint-classification-weight", type=float)
+    outcome_parser.add_argument("--marginal-auxiliary-weight", type=float)
+    outcome_parser.add_argument("--no-joint-pair-head", action="store_true")
+    outcome_parser.add_argument(
+        "--no-emotion-conditioned-heads", action="store_true"
+    )
     outcome_parser.add_argument("--ordinal-auxiliary-weight", type=float)
     outcome_parser.add_argument("--consistency-weight", type=float)
     outcome_parser.add_argument("--auxiliary-regression-weight", type=float)

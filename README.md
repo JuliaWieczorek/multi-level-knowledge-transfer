@@ -39,12 +39,18 @@ that have not yet observed a supporter strategy.
 Before extending this matrix, the project now includes a stricter 100% context
 ceiling experiment. It consumes the complete role-marked dialogue plus
 train-vocabulary encodings of initial intensity, a MEISD-compatible negative
-emotion family, and problem type. A cumulative ordinal head predicts final
-intensity; drop magnitude is derived exactly as `initial - final`, so the two
-reported outcomes cannot contradict each other. Its full architecture also
-adds continuous speaker composition for every text chunk, separate early and
-late seeker representations, an ordered strategy encoder, and an auxiliary
-drop-regression loss used only as a training regulariser.
+emotion family, and problem type. Its full architecture also adds continuous
+speaker composition for every text chunk, separate early and late seeker
+representations, an ordered strategy encoder, and auxiliary ordinal and
+drop-regression losses used only as training regularisers.
+
+The strengthened ceiling model directly predicts the ten valid
+`(final intensity, drop magnitude)` pairs. Invalid pairs are masked using the
+initial intensity before decoding, while auxiliary marginal and ordinal heads
+regularise training. Each categorical outcome head contains a shared classifier
+plus a small residual expert selected by the negative emotion family. This makes
+emotion-conditioned outcome prediction explicit rather than relying only on a
+metadata-conditioned shared representation.
 
 ## Reused transfer pipeline
 
@@ -186,6 +192,42 @@ python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 4
 # does not duplicate the full strength of class-balanced focal loss.
 python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name joint_balanced_p05 --outcome-sampling-strategy joint --joint-sampling-power 0.5
 
+# First isolate the new joint-pair and emotion-conditioned heads on the original
+# ESConv training set. This run requires no new text generation and never reads test.
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name joint_emotion_original
+
+# Component ablations on the same untouched training/validation data.
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name joint_only --no-emotion-conditioned-heads
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name emotion_heads_only --no-joint-pair-head
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name legacy_factorized_heads --no-joint-pair-head --no-emotion-conditioned-heads
+
+# Inspect the deterministic 50% target-augmentation plan without loading an LLM.
+python -m mlkt.cli augment-outcomes --plan-only `
+  --output-dir data\processed\outcome_augmentation\plan_50pct
+
+# Small usable pilot focused on the two zero-recall outcomes: final=4 and drop=3.
+# Mock output is only a pipeline smoke test and is rejected by model training.
+python -m mlkt.cli augment-outcomes --mock-generator --max-conversations 3 `
+  --focus-pair 4,1 --focus-pair 1,3 --focus-pair 2,3 `
+  --output-dir data\processed\outcome_augmentation\smoke
+
+python -m mlkt.cli augment-outcomes `
+  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf `
+  --gpu-layers -1 --batch-size 1024 --require-gpu `
+  --max-conversations 30 `
+  --focus-pair 4,1 --focus-pair 1,3 --focus-pair 2,3 `
+  --output-dir data\processed\outcome_augmentation\pilot_30
+
+# Classify the pilot with validation-only model selection.
+python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 `
+  --validation-only --run-name joint_emotion_pilot_30 `
+  --input data\processed\outcome_augmentation\pilot_30\esconv_outcome_augmented.csv
+
+# Only after the pilot improves validation, generate/resume the full 50% plan.
+python -m mlkt.cli augment-outcomes `
+  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf `
+  --gpu-layers -1 --batch-size 1024 --require-gpu --resume
+
 # Architecture ablations (repeat with --transfer after the vanilla control).
 python -m mlkt.cli train-outcome-ceiling --vanilla --architecture base --seed 42
 python -m mlkt.cli train-outcome-ceiling --vanilla --architecture speaker --seed 42
@@ -231,6 +273,11 @@ python -m unittest discover -s tests -v
 - ESConv validation/test rows never inform target-style pattern extraction.
 - MEISD start/end segments remain in one source split.
 - Only source training rows are augmented.
+- Target-side outcome augmentation adds full-context ESConv training rows only;
+  validation and test conversations are copied unchanged.
+- The outcome augmenter rewrites seeker turns in bounded windows, keeps all
+  supporter turns and strategy features unchanged, and preserves joint labels.
+- Deterministic mock outcome augmentation is rejected by neural training.
 - Failed augmentation generations are excluded from source training by default.
 - Test curves are never used for tuning or early stopping.
 - Every run records its split hash, source checkpoint, seed, configuration,

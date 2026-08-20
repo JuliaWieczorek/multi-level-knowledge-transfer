@@ -473,6 +473,51 @@ class CumulativeOrdinalHead(nn.Module):
         return self.score(values) - self.thresholds().unsqueeze(0)
 
 
+OUTCOME_PAIRS: tuple[tuple[int, int], ...] = (
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (1, 4),
+    (2, 1),
+    (2, 2),
+    (2, 3),
+    (3, 1),
+    (3, 2),
+    (4, 1),
+)
+
+
+class EmotionConditionedClassificationHead(nn.Module):
+    """Shared classifier plus a small residual expert for each emotion family."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        emotion_vocabulary_size: int,
+    ) -> None:
+        super().__init__()
+        if emotion_vocabulary_size < 1:
+            raise ValueError("Emotion-conditioned heads require a vocabulary.")
+        self.shared = nn.Linear(input_size, output_size)
+        self.expert_weight = nn.Parameter(
+            torch.zeros(emotion_vocabulary_size, output_size, input_size)
+        )
+        self.expert_bias = nn.Parameter(
+            torch.zeros(emotion_vocabulary_size, output_size)
+        )
+
+    def forward(
+        self, values: torch.Tensor, emotion_ids: torch.Tensor
+    ) -> torch.Tensor:
+        if emotion_ids.ndim != 1 or emotion_ids.shape[0] != values.shape[0]:
+            raise ValueError("Emotion ids must have one value per batch item.")
+        expert_weight = self.expert_weight[emotion_ids]
+        expert_bias = self.expert_bias[emotion_ids]
+        residual = torch.einsum("boi,bi->bo", expert_weight, values)
+        return self.shared(values) + residual + expert_bias
+
+
 class EmotionConditionedOutcomeModel(nn.Module):
     """Role-aware full-context final-intensity model with metadata conditioning."""
 
@@ -492,6 +537,8 @@ class EmotionConditionedOutcomeModel(nn.Module):
         use_trajectory: bool = False,
         use_strategy: bool = False,
         use_auxiliary_regression: bool = True,
+        use_joint_pair_head: bool = True,
+        use_emotion_conditioned_heads: bool = True,
     ) -> None:
         super().__init__()
         self.text_encoder = AffectiveTextEncoder(
@@ -505,6 +552,8 @@ class EmotionConditionedOutcomeModel(nn.Module):
         self.use_trajectory = use_trajectory
         self.use_strategy = use_strategy
         self.use_auxiliary_regression = use_auxiliary_regression
+        self.use_joint_pair_head = use_joint_pair_head
+        self.use_emotion_conditioned_heads = use_emotion_conditioned_heads
         self.trajectory_projection: nn.Module | None = None
         if use_trajectory:
             self.trajectory_projection = nn.Sequential(
@@ -547,8 +596,28 @@ class EmotionConditionedOutcomeModel(nn.Module):
         # Direct class heads optimise the metric used for model selection.  The
         # ordinal and regression heads remain as auxiliary objectives so that
         # the representation still respects distance between intensity levels.
-        self.final_class_head = nn.Linear(hidden // 2, 4)
-        self.drop_class_head = nn.Linear(hidden // 2, 4)
+        head_type = (
+            EmotionConditionedClassificationHead
+            if use_emotion_conditioned_heads
+            else None
+        )
+        self.final_class_head = (
+            head_type(hidden // 2, 4, emotion_vocabulary_size)
+            if head_type is not None
+            else nn.Linear(hidden // 2, 4)
+        )
+        self.drop_class_head = (
+            head_type(hidden // 2, 4, emotion_vocabulary_size)
+            if head_type is not None
+            else nn.Linear(hidden // 2, 4)
+        )
+        self.joint_pair_head: nn.Module | None = None
+        if use_joint_pair_head:
+            self.joint_pair_head = (
+                head_type(hidden // 2, len(OUTCOME_PAIRS), emotion_vocabulary_size)
+                if head_type is not None
+                else nn.Linear(hidden // 2, len(OUTCOME_PAIRS))
+            )
         self.final_head = CumulativeOrdinalHead(hidden // 2, num_classes=4)
         self.drop_regression_head = (
             nn.Linear(hidden // 2, 1) if use_auxiliary_regression else None
@@ -606,11 +675,24 @@ class EmotionConditionedOutcomeModel(nn.Module):
         gamma, beta = self.conditioning(metadata).chunk(2, dim=-1)
         conditioned = self.normalisation(text * (1.0 + gamma) + beta)
         shared = self.shared(conditioned)
+        emotion_ids = batch["emotion_id"]
+        if self.use_emotion_conditioned_heads:
+            final_logits = self.final_class_head(shared, emotion_ids)
+            drop_logits = self.drop_class_head(shared, emotion_ids)
+        else:
+            final_logits = self.final_class_head(shared)
+            drop_logits = self.drop_class_head(shared)
         outputs = {
-            "final_logits": self.final_class_head(shared),
-            "drop_logits": self.drop_class_head(shared),
+            "final_logits": final_logits,
+            "drop_logits": drop_logits,
             "final_ordinal_logits": self.final_head(shared),
         }
+        if self.joint_pair_head is not None:
+            outputs["joint_pair_logits"] = (
+                self.joint_pair_head(shared, emotion_ids)
+                if self.use_emotion_conditioned_heads
+                else self.joint_pair_head(shared)
+            )
         if self.drop_regression_head is not None:
             outputs["drop_regression"] = 1.0 + 3.0 * torch.sigmoid(
                 self.drop_regression_head(shared).squeeze(-1)
