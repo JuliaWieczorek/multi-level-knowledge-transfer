@@ -1450,6 +1450,39 @@ def _joint_marginal_probabilities(
     return final, drop
 
 
+def _assert_finite_tensors(
+    tensors: Iterable[tuple[str, torch.Tensor]],
+    *,
+    stage: str,
+    batch_index: int,
+    conversation_ids: Sequence[str],
+) -> None:
+    """Fail before non-finite values can poison an outcome training run."""
+    for name, tensor in tensors:
+        if not (tensor.is_floating_point() or tensor.is_complex()):
+            continue
+        finite = torch.isfinite(tensor)
+        if bool(finite.all()):
+            continue
+        detached = tensor.detach()
+        finite_values = detached[finite]
+        finite_min = (
+            float(finite_values.min().cpu()) if finite_values.numel() else None
+        )
+        finite_max = (
+            float(finite_values.max().cpu()) if finite_values.numel() else None
+        )
+        raise FloatingPointError(
+            "Non-finite tensor in outcome training: "
+            f"stage={stage}, batch={batch_index}, tensor={name}, "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"nan_count={int(torch.isnan(detached).sum().cpu())}, "
+            f"inf_count={int(torch.isinf(detached).sum().cpu())}, "
+            f"finite_min={finite_min}, finite_max={finite_max}, "
+            f"conversation_ids={list(conversation_ids)}"
+        )
+
+
 def _run_outcome_ceiling_epoch(
     model: EmotionConditionedOutcomeModel,
     loader: DataLoader,
@@ -1502,8 +1535,25 @@ def _run_outcome_ceiling_epoch(
         )
         for batch_index, raw_batch in enumerate(iterator, start=1):
             identifiers.extend(raw_batch["conversation_id"])
+            batch_conversation_ids = [str(value) for value in raw_batch["conversation_id"]]
             batch = _move_tensors(raw_batch, device)
+            _assert_finite_tensors(
+                (
+                    (name, value)
+                    for name, value in batch.items()
+                    if isinstance(value, torch.Tensor)
+                ),
+                stage="batch_inputs",
+                batch_index=batch_index,
+                conversation_ids=batch_conversation_ids,
+            )
             outputs = model(batch)
+            _assert_finite_tensors(
+                outputs.items(),
+                stage="model_outputs",
+                batch_index=batch_index,
+                conversation_ids=batch_conversation_ids,
+            )
             logits = outputs["final_ordinal_logits"]
             targets = cumulative_ordinal_targets(batch["final_target"])
             ordinal_loss = nn.functional.binary_cross_entropy_with_logits(
@@ -1571,11 +1621,50 @@ def _run_outcome_ceiling_epoch(
                     outputs["drop_regression"], batch["drop_target"].float()
                 )
                 loss = loss + auxiliary_regression_weight * auxiliary_loss
+            _assert_finite_tensors(
+                (
+                    ("loss", loss),
+                    ("ordinal_loss", ordinal_loss),
+                    ("final_classification_loss", final_classification_loss),
+                    ("drop_classification_loss", drop_classification_loss),
+                    ("joint_classification_loss", joint_classification_loss),
+                    ("consistency_loss", consistency_loss),
+                    ("auxiliary_regression_loss", auxiliary_loss),
+                ),
+                stage="loss_components",
+                batch_index=batch_index,
+                conversation_ids=batch_conversation_ids,
+            )
             if training:
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                _assert_finite_tensors(
+                    (
+                        (f"{name}.grad", parameter.grad)
+                        for name, parameter in model.named_parameters()
+                        if parameter.grad is not None
+                    ),
+                    stage="gradients_after_backward",
+                    batch_index=batch_index,
+                    conversation_ids=batch_conversation_ids,
+                )
+                gradient_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                _assert_finite_tensors(
+                    (("gradient_norm", gradient_norm),),
+                    stage="gradient_clipping",
+                    batch_index=batch_index,
+                    conversation_ids=batch_conversation_ids,
+                )
                 optimizer.step()
+                _assert_finite_tensors(
+                    (
+                        (name, parameter)
+                        for name, parameter in model.named_parameters()
+                    ),
+                    stage="parameters_after_optimizer",
+                    batch_index=batch_index,
+                    conversation_ids=batch_conversation_ids,
+                )
                 if scheduler is not None:
                     scheduler.step()
             losses.append(float(loss.detach().cpu()))
@@ -1957,6 +2046,32 @@ def train_outcome_ceiling_model(
         ),
         "architecture": config.get("architecture", "base"),
         "outcome_augmentation": outcome_augmentation_report,
+        "environment": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "hip": getattr(torch.version, "hip", None),
+            "cuda_available": torch.cuda.is_available(),
+            "gpu": (
+                torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+            ),
+            "flash_sdp_enabled": (
+                torch.backends.cuda.flash_sdp_enabled()
+                if torch.cuda.is_available()
+                else None
+            ),
+            "memory_efficient_sdp_enabled": (
+                torch.backends.cuda.mem_efficient_sdp_enabled()
+                if torch.cuda.is_available()
+                else None
+            ),
+            "math_sdp_enabled": (
+                torch.backends.cuda.math_sdp_enabled()
+                if torch.cuda.is_available()
+                else None
+            ),
+        },
         "config": config,
     }
     with (output / "run_config.json").open("w", encoding="utf-8") as handle:
@@ -2116,6 +2231,7 @@ def train_outcome_ceiling_model(
         "source_checkpoint": run_config["source_checkpoint"],
         "source_checkpoint_sha256": source_checkpoint_hash,
         "device": str(device),
+        "environment": run_config["environment"],
         "test_evaluated": "test" in evaluation_splits,
         "duration_seconds": time.time() - started_at,
     }

@@ -214,6 +214,17 @@ python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 4
 # ESConv training set. This run requires no new text generation and never reads test.
 python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name joint_emotion_original
 
+# Local AMD preflight (verified on PyTorch 2.9.1 + ROCm 7.2.1). Run offline so
+# the cached BERT assets are used without a Hugging Face network probe.
+$env:HF_HUB_OFFLINE = "1"
+$env:TRANSFORMERS_OFFLINE = "1"
+.venv\Scripts\python.exe -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name joint_emotion_original
+
+# Outcome training fails immediately on any non-finite input, output, loss,
+# gradient, clipping norm, or post-optimizer parameter and reports the batch and
+# conversation ids. PyTorch 2.12.0 + ROCm 7.14 produced infinite StrategyEncoder
+# gradients on the tested RX 9070 and must not be used for the final experiment.
+
 # Component ablations on the same untouched training/validation data.
 python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name joint_only --no-emotion-conditioned-heads
 python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 42 --validation-only --run-name emotion_heads_only --no-joint-pair-head

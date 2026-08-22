@@ -11,6 +11,22 @@ TORCH_AVAILABLE = (
 
 @unittest.skipUnless(TORCH_AVAILABLE, "neural optional dependencies not installed")
 class NeuralContractTests(unittest.TestCase):
+    def test_outcome_finite_guard_reports_stage_batch_and_conversations(self):
+        import torch
+
+        from mlkt.training import _assert_finite_tensors
+
+        with self.assertRaisesRegex(
+            FloatingPointError,
+            r"stage=model_outputs, batch=20, tensor=joint_pair_logits.*conv-a",
+        ):
+            _assert_finite_tensors(
+                (("joint_pair_logits", torch.tensor([[0.0, float("nan")]])),),
+                stage="model_outputs",
+                batch_index=20,
+                conversation_ids=["conv-a"],
+            )
+
     def test_turn_packing_preserves_order_and_boundaries(self):
         from mlkt.neural_data import pack_tokenized_turns
 
