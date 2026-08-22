@@ -1638,33 +1638,27 @@ def _run_outcome_ceiling_epoch(
             if training:
                 optimizer.zero_grad()
                 loss.backward()
-                _assert_finite_tensors(
-                    (
-                        (f"{name}.grad", parameter.grad)
-                        for name, parameter in model.named_parameters()
-                        if parameter.grad is not None
-                    ),
-                    stage="gradients_after_backward",
-                    batch_index=batch_index,
-                    conversation_ids=batch_conversation_ids,
-                )
                 gradient_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                _assert_finite_tensors(
-                    (("gradient_norm", gradient_norm),),
-                    stage="gradient_clipping",
-                    batch_index=batch_index,
-                    conversation_ids=batch_conversation_ids,
-                )
+                if not bool(torch.isfinite(gradient_norm)):
+                    # The aggregate norm is a single inexpensive GPU reduction.
+                    # Only scan individual gradients after it detects a failure.
+                    _assert_finite_tensors(
+                        (
+                            (f"{name}.grad", parameter.grad)
+                            for name, parameter in model.named_parameters()
+                            if parameter.grad is not None
+                        ),
+                        stage="gradients_after_backward",
+                        batch_index=batch_index,
+                        conversation_ids=batch_conversation_ids,
+                    )
+                    _assert_finite_tensors(
+                        (("gradient_norm", gradient_norm),),
+                        stage="gradient_clipping",
+                        batch_index=batch_index,
+                        conversation_ids=batch_conversation_ids,
+                    )
                 optimizer.step()
-                _assert_finite_tensors(
-                    (
-                        (name, parameter)
-                        for name, parameter in model.named_parameters()
-                    ),
-                    stage="parameters_after_optimizer",
-                    batch_index=batch_index,
-                    conversation_ids=batch_conversation_ids,
-                )
                 if scheduler is not None:
                     scheduler.step()
             losses.append(float(loss.detach().cpu()))
