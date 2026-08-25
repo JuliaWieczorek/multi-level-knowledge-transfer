@@ -11,6 +11,10 @@ from mlkt.outcome_augmentation import (
     outcome_rewrite_prompt,
     run_outcome_augmentation,
     validate_outcome_augmentation_frame,
+    _split_seeker_windows,
+    _preserves_protected_concepts,
+    _short_turn_keeps_content_anchor,
+    _apply_novelty_gate,
 )
 
 
@@ -40,6 +44,100 @@ def _row(
 
 
 class OutcomeAugmentationTests(unittest.TestCase):
+    def test_novelty_gate_rejects_near_and_exact_duplicates(self):
+        source = pd.Series(_row("source", "train", 4, 1))
+        near_duplicate = {
+            "text_seeker": "I feel rather stuck.",
+            "changed_seeker_turn_share": 1.0,
+        }
+        with self.assertRaisesRegex(ValueError, "too similar"):
+            _apply_novelty_gate(near_duplicate, source, set(), 0.6, 0.5)
+
+        exact_existing = {
+            "text_seeker": "A different existing conversation.",
+            "changed_seeker_turn_share": 1.0,
+        }
+        with self.assertRaisesRegex(ValueError, "exact seeker-text duplicate"):
+            _apply_novelty_gate(
+                exact_existing,
+                source,
+                {"a different existing conversation."},
+                0.6,
+                0.99,
+            )
+
+    def test_novelty_gate_rejects_too_many_unchanged_turns(self):
+        source = pd.Series(_row("source", "train", 4, 1))
+        generated = {
+            "text_seeker": "I remain trapped in this situation.",
+            "changed_seeker_turn_share": 0.4,
+        }
+        with self.assertRaisesRegex(ValueError, "too few seeker turns changed"):
+            _apply_novelty_gate(generated, source, set(), 0.6, 0.99)
+
+    def test_conservative_semantic_guards_reject_action_substitution(self):
+        self.assertFalse(
+            _short_turn_keeps_content_anchor("riding a motorcyle", "lying in bed")
+        )
+        self.assertFalse(
+            _preserves_protected_concepts("or I could steal one", "I could borrow one")
+        )
+        self.assertTrue(
+            _preserves_protected_concepts("my brother murdered our mom", "he killed her")
+        )
+
+    def test_single_turn_windows_preserve_item_alignment(self):
+        items = [
+            {"seeker": "one", "preceding_supporter": "context"},
+            {"seeker": "two", "preceding_supporter": "context"},
+        ]
+        windows = _split_seeker_windows(
+            items, max_prompt_words=100, max_turns_per_window=1
+        )
+        self.assertEqual([len(window) for window in windows], [1, 1])
+
+    def test_resume_retries_invalid_generation_records(self):
+        frame = pd.DataFrame([_row("train-rare", "train", 4, 1)])
+
+        class InvalidOnceGenerator:
+            name = "invalid-once"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate(self, prompt: str, max_tokens: int, seed: int) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    return "not-json"
+                return '["I still feel stuck."]'
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.csv"
+            output = Path(directory) / "output"
+            frame.to_csv(source, index=False)
+            first_generator = InvalidOnceGenerator()
+            first = run_outcome_augmentation(
+                input_path=source,
+                output_dir=output,
+                generator=first_generator,
+                fraction=1.0,
+                max_generation_attempts=1,
+            )
+            second_generator = InvalidOnceGenerator()
+            second_generator.calls = 1
+            second = run_outcome_augmentation(
+                input_path=source,
+                output_dir=output,
+                generator=second_generator,
+                fraction=1.0,
+                max_generation_attempts=1,
+                resume=True,
+            )
+
+        self.assertEqual(first["valid_generated_conversations"], 0)
+        self.assertEqual(second["valid_generated_conversations"], 1)
+        self.assertEqual(second["invalid_loaded_for_retry"], 1)
+
     def test_plan_prioritises_the_rarest_joint_pair(self):
         rows = [
             _row("rare", "train", 4, 1),
@@ -53,12 +151,30 @@ class OutcomeAugmentationTests(unittest.TestCase):
         self.assertEqual((plan[0]["final_intensity"], plan[0]["drop_magnitude"]), (4, 1))
         self.assertEqual(report["planned_conversations"], 2)
 
+    def test_plan_never_reuses_a_source_conversation(self):
+        rows = [
+            _row("only-rare", "train", 4, 1),
+            *[_row(f"common-{index}", "train", 2, 2) for index in range(4)],
+        ]
+        plan, report = build_outcome_augmentation_plan(
+            pd.DataFrame(rows), fraction=1.0, seed=42
+        )
+        source_ids = [item["source_conversation_id"] for item in plan]
+        self.assertEqual(len(source_ids), 5)
+        self.assertEqual(len(source_ids), len(set(source_ids)))
+        self.assertFalse(report["source_reuse"])
+
     def test_prompt_requests_label_preserving_json_without_supporter_rewrite(self):
         prompt = outcome_rewrite_prompt(["I cannot sleep."], "fear", 5, 3)
         self.assertIn("valid JSON array of exactly 1 strings", prompt)
         self.assertIn("Rewrite only the support seeker's utterances", prompt)
         self.assertIn("initial survey intensity category: 5", prompt)
         self.assertIn("never state these labels or numbers", prompt)
+        self.assertIn("keep short utterances short", prompt)
+        self.assertIn('"minimum_rewrite_words": 1', prompt)
+        self.assertIn('"maximum_rewrite_words": 7', prompt)
+        self.assertIn("smallest wording", prompt)
+        self.assertIn("never answer it", prompt)
 
     def test_pilot_can_focus_zero_recall_pairs(self):
         rows = [

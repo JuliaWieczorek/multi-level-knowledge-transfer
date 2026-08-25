@@ -3,12 +3,17 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-rocm/
 .idea/
+*.egg-info/
 data/processed/*.csv
 data/processed/transfer/
 data/processed/outcome_ceiling/
+data/processed/outcome_augmentation/
+data/models/
 data/ESConv_DA_ready.csv
 data/MEISD_DA_ready.csv
+data/MEISD_text.csv
 *.pt
 *.safetensors
 outputs/**

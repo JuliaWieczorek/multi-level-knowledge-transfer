@@ -317,6 +317,7 @@ def retrospective_ordinal_analysis(
         raise ValueError("bootstrap_samples must be non-negative.")
     try:
         from statsmodels.miscmodels.ordinal_model import OrderedModel
+        from tqdm.auto import tqdm
     except ImportError as error:
         raise RuntimeError(
             "Retrospective ordinal analysis requires statsmodels."
@@ -400,7 +401,13 @@ def retrospective_ordinal_analysis(
             bootstrap_coefficients: dict[str, list[float]] = {
                 feature: [] for feature in retained_features
             }
-            for _ in range(bootstrap_samples):
+            for _ in tqdm(
+                range(bootstrap_samples),
+                desc=f"Bootstrap {target} / {block_name}",
+                unit="fit",
+                leave=False,
+                dynamic_ncols=True,
+            ):
                 indices = rng.integers(0, len(complete), len(complete))
                 sampled_y = endog.iloc[indices].reset_index(drop=True)
                 sampled_x = design.iloc[indices].reset_index(drop=True)

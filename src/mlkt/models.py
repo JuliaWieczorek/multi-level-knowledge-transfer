@@ -63,13 +63,16 @@ class SoftSharingMTL(nn.Module):
         transformer_name: str,
         num_emotions: int,
         dropout: float = 0.4,
+        local_files_only: bool = False,
     ) -> None:
         super().__init__()
         self.transformer_name = transformer_name
         self.num_emotions = num_emotions
         self.encoders = nn.ModuleDict(
             {
-                task: AutoModel.from_pretrained(transformer_name)
+                task: AutoModel.from_pretrained(
+                    transformer_name, local_files_only=local_files_only
+                )
                 for task in self.TASKS
             }
         )
@@ -127,9 +130,14 @@ class SoftSharingMTL(nn.Module):
 def load_transferred_encoder_pair(
     transformer_name: str,
     checkpoint: dict[str, Any] | None,
+    local_files_only: bool = False,
 ) -> tuple[nn.Module, nn.Module]:
-    emotion_encoder = AutoModel.from_pretrained(transformer_name)
-    intensity_encoder = AutoModel.from_pretrained(transformer_name)
+    emotion_encoder = AutoModel.from_pretrained(
+        transformer_name, local_files_only=local_files_only
+    )
+    intensity_encoder = AutoModel.from_pretrained(
+        transformer_name, local_files_only=local_files_only
+    )
     if checkpoint is not None:
         emotion_encoder.load_state_dict(checkpoint["emotion_encoder"])
         intensity_encoder.load_state_dict(checkpoint["intensity_encoder"])
@@ -145,12 +153,15 @@ class AffectiveTextEncoder(nn.Module):
         chunk_layers: int = 2,
         chunk_heads: int = 8,
         max_chunks: int = 32,
+        local_files_only: bool = False,
     ) -> None:
         super().__init__()
         (
             self.emotion_encoder,
             self.intensity_encoder,
-        ) = load_transferred_encoder_pair(transformer_name, transfer_checkpoint)
+        ) = load_transferred_encoder_pair(
+            transformer_name, transfer_checkpoint, local_files_only
+        )
         hidden = self.emotion_encoder.config.hidden_size
         self.hidden_size = hidden
         self.max_chunks = max_chunks
@@ -334,6 +345,7 @@ class TemporalMultiModalModel(nn.Module):
         max_chunks: int = 32,
         use_initial_intensity: bool = False,
         num_outcome_classes: int = 4,
+        local_files_only: bool = False,
     ) -> None:
         super().__init__()
         if modality not in self.MODALITIES:
@@ -353,6 +365,7 @@ class TemporalMultiModalModel(nn.Module):
                 transfer_checkpoint=transfer_checkpoint,
                 dropout=dropout,
                 max_chunks=max_chunks,
+                local_files_only=local_files_only,
             )
             output_size = self.text_encoder.hidden_size
         if "strategy" in modality:

@@ -25,19 +25,26 @@
     "prepared_dir": "../data/processed/transfer/prepared",
     "augmented_dir": "../data/processed/transfer/augmented",
     "augmentation": {
-      "generator": "llama-2-7b-chat-gguf",
+      "generator": "qwen2.5-7b-instruct-gguf",
+      "model_repo": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+      "model_file": "Qwen2.5-7B-Instruct-Q5_K_M.gguf",
+      "model_revision": "8911e8a47f92bac19d6f5c64a2e2095bd2f7d031",
+      "model_cache_dir": "../data/models/huggingface",
       "context_size": 2048,
       "threads": 8,
       "gpu_layers": -1,
       "batch_size": 1024,
       "checkpoint_every": 25,
       "max_tokens": 150,
+      "temperature": 0.5,
+      "top_p": 0.9,
       "min_compatible_samples": 5,
       "max_aug_per_group": 600
     }
   },
   "source_mtl": {
     "transformer_name": "bert-base-uncased",
+    "local_files_only": true,
     "max_length": 128,
     "batch_size": 16,
     "epochs": 6,
@@ -60,6 +67,7 @@
     "early_stopping_patience": 3,
     "num_workers": 0,
     "device": "auto",
+    "precision": "bf16",
     "output_dir": "../outputs/source_mtl"
   },
   "source_aligned_mtl": {
@@ -92,6 +100,7 @@
   },
   "temporal": {
     "transformer_name": "bert-base-uncased",
+    "local_files_only": true,
     "max_length": 128,
     "max_chunks": 32,
     "batch_size": 8,
@@ -104,6 +113,8 @@
     "early_stopping_patience": 3,
     "num_workers": 0,
     "device": "auto",
+    "precision": "bf16",
+    "retain_best_model": false,
     "output_dir": "../outputs/temporal"
   },
   "outcome_ceiling": {
@@ -151,14 +162,24 @@
   "outcome_augmentation": {
     "input_path": "../data/processed/outcome_ceiling/esconv_checkpoints.csv",
     "output_dir": "../data/processed/outcome_augmentation/full_50pct",
+    "model_repo": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+    "model_file": "Qwen2.5-7B-Instruct-Q5_K_M.gguf",
+    "model_revision": "8911e8a47f92bac19d6f5c64a2e2095bd2f7d031",
+    "model_cache_dir": "../data/models/huggingface",
     "fraction": 0.5,
     "context_size": 4096,
     "threads": 8,
     "gpu_layers": -1,
     "batch_size": 1024,
     "checkpoint_every": 10,
-    "max_prompt_words": 180,
-    "max_tokens": 640
+    "max_generation_attempts": 3,
+    "max_turns_per_window": 1,
+    "min_changed_turn_share": 0.6,
+    "max_source_text_similarity": 0.92,
+    "max_prompt_words": 100,
+    "max_tokens": 640,
+    "temperature": 0.1,
+    "top_p": 0.9
   },
   "strategy_analysis": {
     "bootstrap_samples": 1000,

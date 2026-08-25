@@ -22,13 +22,18 @@ neural = [
   "accelerate>=0.34",
   "tqdm>=4.66",
 ]
-augmentation = ["llama-cpp-python>=0.3", "tqdm>=4.66"]
+augmentation = [
+  "huggingface-hub>=0.27",
+  "llama-cpp-python>=0.3",
+  "tqdm>=4.66",
+]
 analysis = ["statsmodels>=0.14", "matplotlib>=3.8"]
 all = [
   "torch>=2.2",
   "transformers>=4.45",
   "accelerate>=0.34",
   "llama-cpp-python>=0.3",
+  "huggingface-hub>=0.27",
   "statsmodels>=0.14",
   "matplotlib>=3.8",
 ]

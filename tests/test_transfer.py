@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,10 +7,13 @@ import pandas as pd
 
 from mlkt.transfer import (
     DeterministicMockGenerator,
+    LlamaCppGenerator,
+    _json_array_schema_from_prompt,
     attach_segment_conversation_ids,
     augment_source_training,
     build_augmentation_plan,
     extract_style_patterns,
+    resolve_gguf_model_path,
 )
 
 
@@ -29,6 +33,43 @@ class InterruptingGenerator:
 
 
 class TransferPipelineTests(unittest.TestCase):
+    def test_outcome_prompt_builds_exact_length_json_grammar(self):
+        schema = json.loads(
+            _json_array_schema_from_prompt(
+                "return a valid JSON array of exactly 7 strings and nothing else"
+            )
+        )
+        self.assertEqual(schema["minItems"], 7)
+        self.assertEqual(schema["maxItems"], 7)
+
+    def test_local_gguf_resolution_does_not_require_hugging_face(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.gguf"
+            model.touch()
+            resolved, metadata = resolve_gguf_model_path(model)
+        self.assertEqual(resolved, model.resolve())
+        self.assertEqual(metadata["source"], "local")
+        self.assertIsNone(metadata["hf_repo"])
+
+    def test_gguf_generator_uses_embedded_chat_template(self):
+        class FakeModel:
+            def __init__(self) -> None:
+                self.arguments = None
+
+            def create_chat_completion(self, **arguments):
+                self.arguments = arguments
+                return {"choices": [{"message": {"content": '["rewritten"]'}}]}
+
+        fake = FakeModel()
+        generator = LlamaCppGenerator.__new__(LlamaCppGenerator)
+        generator._model = fake
+        generator._temperature = 0.5
+        generator._top_p = 0.9
+        result = generator.generate("Return JSON.", max_tokens=32, seed=42)
+        self.assertEqual(result, '["rewritten"]')
+        self.assertEqual(fake.arguments["messages"][1]["content"], "Return JSON.")
+        self.assertEqual(fake.arguments["temperature"], 0.5)
+
     def test_segment_ids_preserve_pairs_and_allow_meisd_singletons(self):
         esconv = pd.DataFrame(
             {"segment": ["start", "end", "start", "end"]}

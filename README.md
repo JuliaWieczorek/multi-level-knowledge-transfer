@@ -118,11 +118,31 @@ Full GPU training and analysis:
 python -m pip install -e ".[neural,analysis]"
 ```
 
-Llama-2 GGUF augmentation additionally requires:
+The default experiment configuration uses the already-cached BERT files with
+`local_files_only: true`. Training therefore does not contact Hugging Face and
+can run without network access. Set this option to `false` only when a configured
+transformer still needs to be downloaded.
+
+Source and temporal neural training use BF16 automatic mixed precision by
+default. Model parameters and saved checkpoints remain FP32, while supported GPU
+operations run in BF16. The selected precision is recorded in every run
+configuration and summary; set `precision` to `fp32` to disable autocasting.
+
+Qwen2.5 GGUF augmentation additionally requires:
 
 ```powershell
 python -m pip install -e ".[augmentation]"
 ```
+
+The default generator is `Qwen2.5-7B-Instruct-Q5_K_M`. When no model path is
+provided, its single-file GGUF is downloaded once to
+`data/models/huggingface` on the project drive and reused from that cache on
+later runs. A network connection is needed only for the first download. Use
+`--model-cache-dir` to relocate the cache, `--model-path` for an existing local
+GGUF, or `--model-repo` and `--model-file` to select another Hugging Face model.
+The generator uses the chat template embedded in the GGUF and records the model
+name, repository, filename, resolved cache path, and sampling settings in each
+manifest.
 
 On Windows with an AMD GPU, replace the default CPU wheel with the Vulkan
 wheel:
@@ -146,12 +166,10 @@ python -m mlkt.cli prepare-transfer
 
 # 3. Generate the single target-style augmented MEISD dataset.
 python -m mlkt.cli augment-transfer `
-  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf `
   --gpu-layers -1 --batch-size 1024 --require-gpu --resume
 
 # Benchmark 50 representative generations without writing final outputs.
 python -m mlkt.cli augment-transfer `
-  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf `
   --gpu-layers -1 --batch-size 1024 --require-gpu --benchmark 50
 
 # A non-semantic pipeline smoke test:
@@ -212,7 +230,6 @@ python -m mlkt.cli augment-outcomes --mock-generator --max-conversations 3 `
   --output-dir data\processed\outcome_augmentation\smoke
 
 python -m mlkt.cli augment-outcomes `
-  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf `
   --gpu-layers -1 --batch-size 1024 --require-gpu `
   --max-conversations 30 `
   --focus-pair 4,1 --focus-pair 1,3 --focus-pair 2,3 `
@@ -225,7 +242,6 @@ python -m mlkt.cli train-outcome-ceiling --transfer --architecture full --seed 4
 
 # Only after the pilot improves validation, generate/resume the full 50% plan.
 python -m mlkt.cli augment-outcomes `
-  --llama-model D:\models\llama-2-7b-chat.Q5_K_M.gguf `
   --gpu-layers -1 --batch-size 1024 --require-gpu --resume
 
 # Architecture ablations (repeat with --transfer after the vanilla control).
@@ -234,6 +250,20 @@ python -m mlkt.cli train-outcome-ceiling --vanilla --architecture speaker --seed
 python -m mlkt.cli train-outcome-ceiling --vanilla --architecture trajectory --seed 42
 python -m mlkt.cli train-outcome-ceiling --vanilla --architecture strategies --seed 42
 ```
+
+After augmentation is complete, the remaining study can also be run with one
+resumable command:
+
+```powershell
+python -m mlkt.cli run-pipeline
+```
+
+This performs source pretraining, the 150-run target matrix, strategy analyses,
+and final reporting in sequence. It prints a coarse live summary after every
+source seed and every five target runs, including elapsed time, completed runs,
+and an approximate training ETA. Re-running the same command skips compatible
+completed source seeds and target runs. Bootstrap analyses display their own live
+progress and ETA.
 
 Full augmentation appends every result to `augmentation_progress.jsonl`.
 Repeating the same command with `--resume` continues from that file. Final CSV
@@ -244,6 +274,14 @@ including ETA, current loss, validation metrics, and the best epoch. Durable pro
 events are appended to `source_training_progress.jsonl` for source pretraining,
 `training_progress.jsonl` for each target run, and `matrix_progress.jsonl` for the
 complete target matrix.
+
+By default, each target run uses its temporary `best_model.pt` for final
+validation/test evaluation and then removes it after predictions, metrics,
+diagnostics, and training history have been written. This prevents the complete
+150-run matrix from accumulating roughly 100 GiB of target checkpoints. The five
+source-transfer checkpoints are retained because subsequent target runs need
+them. Set `temporal.retain_best_model` to `true` when the trained target models
+themselves are required for later inference.
 
 Single-run example:
 
@@ -309,6 +347,9 @@ but all selected temporal target models must be trained again.
   validation and test conversations are copied unchanged.
 - The outcome augmenter rewrites seeker turns in bounded windows, keeps all
   supporter turns and strategy features unchanged, and preserves joint labels.
+- Each source conversation is augmented at most once. Exact text duplicates,
+  near-copies of the source, and generations with too few changed seeker turns
+  are rejected before they can enter the training CSV.
 - Deterministic mock outcome augmentation is rejected by neural training.
 - Failed augmentation generations are excluded from source training by default.
 - Test curves are never used for tuning or early stopping.

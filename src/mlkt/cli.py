@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -211,12 +212,20 @@ def augment_transfer(args: argparse.Namespace) -> None:
             raise ValueError("--require-gpu cannot be used with --mock-generator.")
         generator = DeterministicMockGenerator()
     else:
-        if not args.llama_model:
-            raise ValueError(
-                "--llama-model is required unless --mock-generator is used."
-            )
         generator = LlamaCppGenerator(
-            args.llama_model,
+            args.model_path or args.llama_model,
+            hf_repo=args.model_repo or augmentation.get("model_repo"),
+            hf_filename=args.model_file or augmentation.get("model_file"),
+            hf_revision=augmentation.get("model_revision"),
+            cache_dir=(
+                Path(args.model_cache_dir).resolve()
+                if args.model_cache_dir
+                else _config_output_path(
+                    augmentation["model_cache_dir"], config_path
+                )
+                if augmentation.get("model_cache_dir")
+                else None
+            ),
             context_size=augmentation["context_size"],
             threads=augmentation["threads"],
             gpu_layers=(
@@ -230,6 +239,8 @@ def augment_transfer(args: argparse.Namespace) -> None:
                 else augmentation.get("batch_size", 1024)
             ),
             require_gpu=args.require_gpu,
+            temperature=augmentation.get("temperature", 0.5),
+            top_p=augmentation.get("top_p", 0.9),
         )
     manifest = run_augmentation_pipeline(
         prepared_esconv_path=prepared_dir / "esconv_transfer_prepared.csv",
@@ -269,13 +280,20 @@ def augment_outcomes(args: argparse.Namespace) -> None:
                 raise ValueError("--require-gpu cannot be used with a mock generator.")
             generator = DeterministicOutcomeMockGenerator()
         else:
-            if not args.llama_model:
-                raise ValueError(
-                    "--llama-model is required unless --plan-only or "
-                    "--mock-generator is used."
-                )
             generator = LlamaCppGenerator(
-                args.llama_model,
+                args.model_path or args.llama_model,
+                hf_repo=args.model_repo or augmentation.get("model_repo"),
+                hf_filename=args.model_file or augmentation.get("model_file"),
+                hf_revision=augmentation.get("model_revision"),
+                cache_dir=(
+                    Path(args.model_cache_dir).resolve()
+                    if args.model_cache_dir
+                    else _config_output_path(
+                        augmentation["model_cache_dir"], config_path
+                    )
+                    if augmentation.get("model_cache_dir")
+                    else None
+                ),
                 context_size=augmentation.get("context_size", 4096),
                 threads=augmentation.get("threads", 8),
                 gpu_layers=(
@@ -289,6 +307,8 @@ def augment_outcomes(args: argparse.Namespace) -> None:
                     else augmentation.get("batch_size", 1024)
                 ),
                 require_gpu=args.require_gpu,
+                temperature=augmentation.get("temperature", 0.5),
+                top_p=augmentation.get("top_p", 0.9),
             )
     focus_pairs = None
     if args.focus_pair:
@@ -322,6 +342,12 @@ def augment_outcomes(args: argparse.Namespace) -> None:
             if args.checkpoint_every is not None
             else augmentation.get("checkpoint_every", 10)
         ),
+        max_generation_attempts=augmentation.get("max_generation_attempts", 3),
+        max_turns_per_window=augmentation.get("max_turns_per_window", 1),
+        min_changed_turn_share=augmentation.get("min_changed_turn_share", 0.6),
+        max_source_text_similarity=augmentation.get(
+            "max_source_text_similarity", 0.92
+        ),
         resume=args.resume,
         plan_only=args.plan_only,
     )
@@ -329,8 +355,9 @@ def augment_outcomes(args: argparse.Namespace) -> None:
 
 
 def pretrain_transfer(args: argparse.Namespace) -> None:
-    from .training import pretrain_source_mtl
     from tqdm.auto import tqdm
+
+    from .training import pretrain_source_mtl
 
     config_path = Path(args.config).resolve()
     config = _load_config(config_path)
@@ -657,6 +684,198 @@ def compare_label_schemes(args: argparse.Namespace) -> None:
     print(json.dumps(manifest, indent=2))
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min {seconds:02d} s"
+    return f"{seconds} s"
+
+
+def _target_run_weight(run: dict[str, object]) -> float:
+    if run["modality"] == "strategy":
+        return 0.08
+    checkpoint_weights = {10: 1.0, 25: 1.18, 50: 1.78, 75: 2.42, 100: 2.85}
+    weight = checkpoint_weights[int(run["checkpoint_percent"])]
+    if run["modality"] == "text_strategy":
+        weight *= 1.05
+    return weight
+
+
+def run_pipeline(args: argparse.Namespace) -> None:
+    """Run the complete post-augmentation study with coarse live ETA updates."""
+    from tqdm.auto import tqdm
+
+    from .experiments import matrix_manifest, run_experiment_matrix
+    from .reporting import build_report
+    from .strategy import retrospective_ordinal_analysis, run_nested_strategy_models
+    from .training import pretrain_source_mtl
+    from .validation import (
+        validate_augmentation_artifacts,
+        validate_source_training_frame,
+    )
+
+    started = time.time()
+    config_path = Path(args.config).resolve()
+    config = _load_config(config_path)
+    transfer = config["transfer"]
+    source_config = config["source_mtl"]
+    temporal_config = config["temporal"]
+    source_path = (
+        _config_output_path(transfer["augmented_dir"], config_path)
+        / "meisd_target_style_onehot.csv"
+    )
+    checkpoints_path = _resolve_config_path(
+        transfer["esconv_checkpoints_path"], config_path
+    )
+    source_root = _config_output_path(source_config["output_dir"], config_path)
+    temporal_root = _config_output_path(temporal_config["output_dir"], config_path)
+    strategy_root = _config_output_path(
+        config["strategy_analysis"]["output_dir"], config_path
+    )
+    report_root = _config_output_path(config["reporting"]["output_dir"], config_path)
+
+    tqdm.write("[PIPELINE 1/5] Preflight danych")
+    source_frame = pd.read_csv(source_path)
+    validate_augmentation_artifacts(source_path, source_frame)
+    emotion_names = sorted(
+        column.split("emotion__", 1)[1]
+        for column in source_frame.columns
+        if column.startswith("emotion__")
+    )
+    validate_source_training_frame(
+        source_frame,
+        emotion_names,
+        exclude_invalid_generations=source_config.get(
+            "exclude_invalid_generations", True
+        ),
+        drop_exact_train_duplicates=source_config.get(
+            "drop_exact_train_duplicates", True
+        ),
+        drop_conflicting_train_texts=source_config.get(
+            "drop_conflicting_train_texts", True
+        ),
+    )
+    tqdm.write("[PIPELINE] Preflight OK")
+
+    seed_count = len(config["seeds"])
+    tqdm.write(f"[PIPELINE 2/5] Source transfer: {seed_count} seedów")
+    for index, seed in enumerate(config["seeds"], start=1):
+        seed_dir = source_root / f"seed_{seed}"
+        checkpoint_path = seed_dir / "source_transfer_checkpoint.pt"
+        summary_path = seed_dir / "source_summary.json"
+        run_config_path = seed_dir / "run_config.json"
+        reusable = False
+        if not args.overwrite and all(
+            path.exists() for path in (checkpoint_path, summary_path, run_config_path)
+        ):
+            with run_config_path.open("r", encoding="utf-8") as handle:
+                previous = json.load(handle)
+            reusable = previous.get("config") == source_config
+        if reusable:
+            tqdm.write(
+                f"[PIPELINE] Source {index}/{seed_count}, seed {seed}: już ukończony"
+            )
+            continue
+        summary = pretrain_source_mtl(
+            source_path=source_path,
+            output_dir=seed_dir,
+            seed=seed,
+            config=source_config,
+            progress_position=1,
+        )
+        tqdm.write(
+            f"[PIPELINE] Source {index}/{seed_count}, seed {seed}: ukończony w "
+            f"{_format_duration(float(summary['duration_seconds']))}"
+        )
+
+    runs = matrix_manifest(config["checkpoints"], config["seeds"])
+    total_weight = sum(_target_run_weight(run) for run in runs)
+    observed_duration = 0.0
+    observed_weight = 0.0
+    processed = 0
+
+    def target_progress(event: dict[str, object]) -> None:
+        nonlocal observed_duration, observed_weight, processed
+        run = event["run"]
+        assert isinstance(run, dict)
+        duration = float(event["duration_seconds"])
+        weight = _target_run_weight(run)
+        if duration > 0:
+            observed_duration += duration
+            observed_weight += weight
+        processed = int(event["completed"]) + int(event["skipped"])
+        if processed % 5 and processed != int(event["planned"]):
+            return
+        eta_text = "zbieranie danych do ETA"
+        if observed_weight > 0:
+            remaining_weight = max(total_weight - observed_weight, 0.0)
+            eta_text = _format_duration(
+                observed_duration / observed_weight * remaining_weight
+            )
+        tqdm.write(
+            f"[PIPELINE] Target {processed}/{event['planned']} runów | "
+            f"czas sesji {_format_duration(time.time() - started)} | "
+            f"ETA treningu ~{eta_text}"
+        )
+
+    tqdm.write("[PIPELINE 3/5] Macierz docelowa: 150 runów")
+    run_experiment_matrix(
+        checkpoints_path=checkpoints_path,
+        source_root=source_root,
+        output_root=temporal_root,
+        config=temporal_config,
+        checkpoints=config["checkpoints"],
+        seeds=config["seeds"],
+        skip_existing=not args.overwrite,
+        progress_callback=target_progress,
+    )
+
+    tqdm.write("[PIPELINE 4/5] Analiza strategii")
+    checkpoint_frame = pd.read_csv(checkpoints_path)
+    prospective_manifest = (
+        strategy_root / "prospective" / "prospective_analysis_manifest.json"
+    )
+    if args.overwrite or not prospective_manifest.exists():
+        run_nested_strategy_models(
+            checkpoint_frame, strategy_root / "prospective", seed=config["seed"]
+        )
+    else:
+        tqdm.write("[PIPELINE] Analiza prospektywna już ukończona")
+    retrospective_manifest = (
+        strategy_root / "retrospective" / "retrospective_analysis_manifest.json"
+    )
+    if args.overwrite or not retrospective_manifest.exists():
+        retrospective_ordinal_analysis(
+            checkpoint_frame,
+            strategy_root / "retrospective",
+            bootstrap_samples=config["strategy_analysis"]["bootstrap_samples"],
+            seed=config["seed"],
+        )
+    else:
+        tqdm.write("[PIPELINE] Analiza retrospektywna już ukończona")
+
+    tqdm.write("[PIPELINE 5/5] Raport końcowy")
+    manifest = build_report(temporal_root, report_root)
+    pipeline_summary = {
+        "status": "complete",
+        "duration_seconds": time.time() - started,
+        "source_seeds": config["seeds"],
+        "target_runs": len(runs),
+        "report_manifest": manifest,
+    }
+    report_root.mkdir(parents=True, exist_ok=True)
+    with (report_root / "pipeline_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(pipeline_summary, handle, indent=2)
+    tqdm.write(
+        "[PIPELINE] CAŁOŚĆ UKOŃCZONA w "
+        f"{_format_duration(time.time() - started)}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mlkt")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -713,7 +932,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     augment_parser = subparsers.add_parser("augment-transfer")
     augment_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    augment_parser.add_argument("--llama-model")
+    augment_parser.add_argument("--model-path")
+    augment_parser.add_argument("--model-repo")
+    augment_parser.add_argument("--model-file")
+    augment_parser.add_argument("--model-cache-dir")
+    augment_parser.add_argument("--llama-model", help=argparse.SUPPRESS)
     augment_parser.add_argument("--mock-generator", action="store_true")
     augment_parser.add_argument("--output-dir")
     augment_parser.add_argument("--gpu-layers", type=int)
@@ -728,7 +951,11 @@ def build_parser() -> argparse.ArgumentParser:
     outcome_augment_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     outcome_augment_parser.add_argument("--input")
     outcome_augment_parser.add_argument("--output-dir")
-    outcome_augment_parser.add_argument("--llama-model")
+    outcome_augment_parser.add_argument("--model-path")
+    outcome_augment_parser.add_argument("--model-repo")
+    outcome_augment_parser.add_argument("--model-file")
+    outcome_augment_parser.add_argument("--model-cache-dir")
+    outcome_augment_parser.add_argument("--llama-model", help=argparse.SUPPRESS)
     outcome_augment_parser.add_argument("--mock-generator", action="store_true")
     outcome_augment_parser.add_argument("--plan-only", action="store_true")
     outcome_augment_parser.add_argument("--fraction", type=float)
@@ -868,6 +1095,11 @@ def build_parser() -> argparse.ArgumentParser:
     comparison_parser.add_argument("--coarse-report", required=True)
     comparison_parser.add_argument("--output-dir", required=True)
     comparison_parser.set_defaults(function=compare_label_schemes)
+
+    pipeline_parser = subparsers.add_parser("run-pipeline")
+    pipeline_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    pipeline_parser.add_argument("--overwrite", action="store_true")
+    pipeline_parser.set_defaults(function=run_pipeline)
     return parser
 
 

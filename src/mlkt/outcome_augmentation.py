@@ -6,6 +6,7 @@ import math
 import os
 import random
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -14,8 +15,59 @@ import pandas as pd
 from .transfer import TextGenerator
 
 
+_CONTENT_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "could", "for",
+    "from", "have", "i", "in", "is", "it", "just", "me", "my", "of",
+    "on", "one", "or", "so", "that", "the", "this", "to", "was", "well",
+    "will", "with", "you",
+}
+
+_PROTECTED_CONCEPTS = (
+    ("motorcy",),
+    ("steal", "stole", "stolen", "theft"),
+    ("drink", "drinking", "alcohol"),
+    ("murder", "murdered", "kill", "killed"),
+    ("die", "died", "dead", "death"),
+    ("illness", "disease", "sick"),
+    ("poverty",),
+)
+
+
 def _normalise_space(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _content_tokens(value: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z]+", str(value).lower())
+        if len(token) >= 3 and token not in _CONTENT_STOPWORDS
+    ]
+
+
+def _short_turn_keeps_content_anchor(source: str, generated: str) -> bool:
+    if len(str(source).split()) > 7:
+        return True
+    source_tokens = _content_tokens(source)
+    generated_tokens = _content_tokens(generated)
+    if not source_tokens:
+        return True
+    return any(
+        SequenceMatcher(None, left, right).ratio() >= 0.86
+        for left in source_tokens
+        for right in generated_tokens
+    )
+
+
+def _preserves_protected_concepts(source: str, generated: str) -> bool:
+    source_lower = str(source).lower()
+    generated_lower = str(generated).lower()
+    for equivalents in _PROTECTED_CONCEPTS:
+        if any(term in source_lower for term in equivalents) and not any(
+            term in generated_lower for term in equivalents
+        ):
+            return False
+    return True
 
 
 def _full_train_rows(frame: pd.DataFrame) -> pd.DataFrame:
@@ -56,9 +108,9 @@ def build_outcome_augmentation_plan(
     if max_conversations is not None and max_conversations < 1:
         raise ValueError("max_conversations must be positive when provided.")
     train = _full_train_rows(frame)
-    budget = int(math.ceil(len(train) * fraction))
+    requested_budget = int(math.ceil(len(train) * fraction))
     if max_conversations is not None:
-        budget = min(budget, int(max_conversations))
+        requested_budget = min(requested_budget, int(max_conversations))
 
     groups = {
         pair: group.index.tolist()
@@ -76,6 +128,8 @@ def build_outcome_augmentation_plan(
             raise ValueError(
                 f"Requested focus pairs are absent from training: {sorted(missing_pairs)}"
             )
+    eligible_sources = sum(len(indices) for indices in groups.values())
+    budget = min(requested_budget, eligible_sources)
     counts = {tuple(map(int, pair)): len(indices) for pair, indices in groups.items()}
     adjusted_counts = dict(counts)
     rng = random.Random(seed)
@@ -90,10 +144,17 @@ def build_outcome_augmentation_plan(
 
     plan: list[dict[str, Any]] = []
     for generation_index in range(budget):
-        pair = min(adjusted_counts, key=lambda value: (adjusted_counts[value], value))
+        available_pairs = [
+            pair
+            for pair, sources in shuffled_sources.items()
+            if source_positions[pair] < len(sources)
+        ]
+        pair = min(
+            available_pairs, key=lambda value: (adjusted_counts[value], value)
+        )
         sources = shuffled_sources[pair]
         position = source_positions[pair]
-        source_index = sources[position % len(sources)]
+        source_index = sources[position]
         source_positions[pair] = position + 1
         adjusted_counts[pair] += 1
         source = train.loc[source_index]
@@ -115,7 +176,10 @@ def build_outcome_augmentation_plan(
         "seed": seed,
         "fraction": fraction,
         "original_train_conversations": len(train),
+        "eligible_source_conversations": eligible_sources,
+        "requested_conversations": requested_budget,
         "planned_conversations": len(plan),
+        "source_reuse": False,
         "max_conversations": max_conversations,
         "focus_pairs": (
             [list(pair) for pair in sorted({tuple(pair) for pair in focus_pairs})]
@@ -135,10 +199,14 @@ def build_outcome_augmentation_plan(
 
 
 def _split_seeker_windows(
-    seeker_items: Sequence[dict[str, str]], max_prompt_words: int
+    seeker_items: Sequence[dict[str, str]],
+    max_prompt_words: int,
+    max_turns_per_window: int | None = None,
 ) -> list[list[dict[str, str]]]:
     if max_prompt_words < 20:
         raise ValueError("max_prompt_words must be at least 20.")
+    if max_turns_per_window is not None and max_turns_per_window < 1:
+        raise ValueError("max_turns_per_window must be at least 1.")
     windows: list[list[dict[str, str]]] = []
     current: list[dict[str, str]] = []
     current_words = 0
@@ -148,7 +216,13 @@ def _split_seeker_windows(
             + len(str(item.get("preceding_supporter", "")).split()),
             1,
         )
-        if current and current_words + words > max_prompt_words:
+        if current and (
+            current_words + words > max_prompt_words
+            or (
+                max_turns_per_window is not None
+                and len(current) >= max_turns_per_window
+            )
+        ):
             windows.append(current)
             current = []
             current_words = 0
@@ -172,15 +246,30 @@ def outcome_rewrite_prompt(
         raise ValueError("Each seeker turn requires aligned supporter context.")
     original = json.dumps(
         [
-            {"preceding_supporter": context, "seeker": turn}
+            {
+                "context_only_do_not_answer": context,
+                "seeker": turn,
+                "minimum_rewrite_words": (
+                    1
+                    if len(turn.split()) < 6
+                    else math.ceil(len(turn.split()) * 0.4)
+                ),
+                "maximum_rewrite_words": (
+                    len(turn.split()) + 4
+                    if len(turn.split()) < 6
+                    else math.floor(len(turn.split()) * 2.5)
+                ),
+            }
             for context, turn in zip(contexts, seeker_turns)
         ],
         ensure_ascii=False,
     )
     return f"""Create a label-preserving paraphrase for an emotional-support dialogue.
 
-Rewrite only the support seeker's utterances below. They are consecutive seeker
-utterances from one conversation and must remain coherent in the same order.
+Rewrite only the support seeker's utterances below. Make the smallest wording
+changes needed for a natural paraphrase. The supporter text is context only:
+never answer it and never replace the seeker's response with another plausible
+response. The seeker utterances must remain coherent in the same order.
 
 Original context-and-seeker JSON:
 {original}
@@ -192,10 +281,19 @@ Latent constraints for preservation only (never state these labels or numbers):
 
 Rules:
 - return a valid JSON array of exactly {len(seeker_turns)} strings and nothing else
-- preserve every fact, event, person, uncertainty, and conversational intention
+- preserve every fact, event, person, object, action, uncertainty, negation,
+  number, time relation, sarcasm, and conversational intention
 - preserve the emotional severity and trajectory at each point; do not invent,
   remove, strengthen, or weaken improvement or deterioration
-- use natural, varied language typical of a person seeking emotional support
+- keep explicit references to violence, death, alcohol, theft, illness, poverty,
+  and named activities; never replace them with safer or related alternatives
+- use natural language typical of a person seeking emotional support, but prefer
+  a conservative edit over a creative rewrite
+- keep short utterances short: when an original seeker utterance has fewer than
+  6 words, add no more than 4 words; it is acceptable to return that short
+  utterance unchanged when changing it would alter its meaning
+- obey `minimum_rewrite_words` and `maximum_rewrite_words` separately for every
+  item; these bounds refer only to the corresponding output string
 - do not add diagnoses, advice, supporter replies, annotations, role names, labels,
   intensity numbers, explanations, markdown, or stage directions
 - each rewritten item must correspond to the original item at the same position
@@ -238,6 +336,7 @@ def _rewrite_seeker_turns(
     generation_seed: int,
     max_prompt_words: int,
     max_tokens: int,
+    max_turns_per_window: int = 1,
 ) -> list[str]:
     rewritten: list[str] = []
     if len(preceding_supporter_turns) != len(seeker_turns):
@@ -246,7 +345,11 @@ def _rewrite_seeker_turns(
         {"preceding_supporter": context, "seeker": turn}
         for context, turn in zip(preceding_supporter_turns, seeker_turns)
     ]
-    windows = _split_seeker_windows(items, max_prompt_words)
+    windows = _split_seeker_windows(
+        items,
+        max_prompt_words,
+        max_turns_per_window=max_turns_per_window,
+    )
     for window_index, window in enumerate(windows):
         prompt = outcome_rewrite_prompt(
             [item["seeker"] for item in window],
@@ -264,15 +367,39 @@ def _rewrite_seeker_turns(
     if len(rewritten) != len(seeker_turns):
         raise AssertionError("Rewriting changed the number of seeker turns.")
     changed = 0
-    for original, generated in zip(seeker_turns, rewritten):
+    for index, (original, generated) in enumerate(zip(seeker_turns, rewritten)):
+        source_numbers = re.findall(r"\b\d+(?:[.,]\d+)?\b", str(original))
+        generated_numbers = re.findall(r"\b\d+(?:[.,]\d+)?\b", generated)
+        structural_artefact = generated.strip() in {
+            "{", "}", "[", "]", '"', "null"
+        }
+        unsafe_semantic_rewrite = (
+            source_numbers != generated_numbers
+            or not _short_turn_keeps_content_anchor(str(original), generated)
+            or not _preserves_protected_concepts(str(original), generated)
+        )
+        if structural_artefact or unsafe_semantic_rewrite:
+            # Keeping the observed source turn is safer than introducing a
+            # plausible but factually different synthetic response.
+            rewritten[index] = str(original)
+            generated = str(original)
         if _normalise_space(original).lower() != generated.lower():
             changed += 1
         original_words = max(len(str(original).split()), 1)
-        length_ratio = len(generated.split()) / original_words
-        if not 0.4 <= length_ratio <= 2.5:
+        generated_words = len(generated.split())
+        length_ratio = generated_words / original_words
+        short_turn_too_long = (
+            original_words < 6 and generated_words > original_words + 4
+        )
+        regular_turn_outside_ratio = (
+            original_words >= 6 and not 0.4 <= length_ratio <= 2.5
+        )
+        if short_turn_too_long or regular_turn_outside_ratio:
             raise ValueError(
                 "Generated turn length is inconsistent with its source "
-                f"(ratio={length_ratio:.2f})."
+                f"(source_words={original_words}, generated_words={generated_words}, "
+                f"ratio={length_ratio:.2f}, source={str(original)[:180]!r}, "
+                f"generated={generated[:180]!r})."
             )
         if generated.lower().startswith(("seeker:", "supporter:")):
             raise ValueError("Generated text included an explicit role label.")
@@ -336,6 +463,45 @@ def _augmented_row(
         }
     )
     return row
+
+
+def _text_duplicate_key(value: Any) -> str:
+    return _normalise_space(str(value)).casefold()
+
+
+def _apply_novelty_gate(
+    generated_row: dict[str, Any],
+    source: pd.Series,
+    known_texts: set[str],
+    min_changed_turn_share: float,
+    max_source_text_similarity: float,
+) -> None:
+    """Reject synthetic conversations that add too little textual information."""
+    changed_share = float(generated_row["changed_seeker_turn_share"])
+    source_text = _text_duplicate_key(source["text_seeker"])
+    generated_text = _text_duplicate_key(generated_row["text_seeker"])
+    source_similarity = SequenceMatcher(None, source_text, generated_text).ratio()
+    generated_row.update(
+        {
+            "source_text_similarity": source_similarity,
+            "min_changed_turn_share_required": min_changed_turn_share,
+            "max_source_text_similarity_allowed": max_source_text_similarity,
+        }
+    )
+    if changed_share < min_changed_turn_share:
+        raise ValueError(
+            "Novelty gate rejected generation: too few seeker turns changed "
+            f"(share={changed_share:.3f}, required={min_changed_turn_share:.3f})."
+        )
+    if source_similarity > max_source_text_similarity:
+        raise ValueError(
+            "Novelty gate rejected generation: seeker text is too similar to its source "
+            f"(similarity={source_similarity:.3f}, maximum={max_source_text_similarity:.3f})."
+        )
+    if generated_text in known_texts:
+        raise ValueError(
+            "Novelty gate rejected generation: exact seeker-text duplicate already exists."
+        )
 
 
 class DeterministicOutcomeMockGenerator:
@@ -418,6 +584,32 @@ def validate_outcome_augmentation_frame(frame: pd.DataFrame) -> dict[str, Any]:
         raise ValueError("Mock outcome augmentation cannot be used for training.")
     if generated["conversation_id"].duplicated().any():
         raise ValueError("Augmented conversation ids must be unique.")
+    generated_text_keys = generated["text_seeker"].map(_text_duplicate_key)
+    original_text_keys = set(frame.loc[~augmented, "text_seeker"].map(_text_duplicate_key))
+    if generated_text_keys.duplicated().any() or generated_text_keys.isin(
+        original_text_keys
+    ).any():
+        raise ValueError("Augmented seeker texts must not duplicate existing texts.")
+    novelty_columns = {
+        "changed_seeker_turn_share",
+        "source_text_similarity",
+        "min_changed_turn_share_required",
+        "max_source_text_similarity_allowed",
+    }
+    missing_novelty = novelty_columns - set(generated.columns)
+    if missing_novelty:
+        raise ValueError(
+            "Outcome augmentation is missing novelty metrics: "
+            f"{sorted(missing_novelty)}"
+        )
+    changed_share = generated["changed_seeker_turn_share"].astype(float)
+    required_changed_share = generated["min_changed_turn_share_required"].astype(float)
+    source_similarity = generated["source_text_similarity"].astype(float)
+    allowed_similarity = generated["max_source_text_similarity_allowed"].astype(float)
+    if (changed_share < required_changed_share).any():
+        raise ValueError("Augmented rows violate the minimum changed-turn share.")
+    if (source_similarity > allowed_similarity).any():
+        raise ValueError("Augmented rows are too similar to their source conversations.")
     if (
         generated["final_intensity"].astype(int)
         + generated["drop_magnitude"].astype(int)
@@ -460,6 +652,10 @@ def run_outcome_augmentation(
     max_prompt_words: int = 180,
     max_tokens: int = 640,
     checkpoint_every: int = 10,
+    max_generation_attempts: int = 3,
+    max_turns_per_window: int = 1,
+    min_changed_turn_share: float = 0.6,
+    max_source_text_similarity: float = 0.92,
     resume: bool = False,
     plan_only: bool = False,
 ) -> dict[str, Any]:
@@ -475,15 +671,23 @@ def run_outcome_augmentation(
         max_conversations=max_conversations,
         focus_pairs=focus_pairs,
     )
-    signature = _plan_signature(plan, report)
+    if not 0.0 < min_changed_turn_share <= 1.0:
+        raise ValueError("min_changed_turn_share must be in (0, 1].")
+    if not 0.0 <= max_source_text_similarity < 1.0:
+        raise ValueError("max_source_text_similarity must be in [0, 1).")
     report = {
         **report,
         "input_path": str(source_path),
         "input_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
-        "plan_signature": signature,
         "max_prompt_words": max_prompt_words,
         "max_tokens": max_tokens,
+        "max_generation_attempts": max_generation_attempts,
+        "max_turns_per_window": max_turns_per_window,
+        "min_changed_turn_share": min_changed_turn_share,
+        "max_source_text_similarity": max_source_text_similarity,
     }
+    signature = _plan_signature(plan, report)
+    report["plan_signature"] = signature
     _atomic_json(output / "augmentation_plan.json", plan)
     if plan_only:
         report["status"] = "planned"
@@ -493,10 +697,15 @@ def run_outcome_augmentation(
         raise ValueError("A text generator is required unless plan_only=True.")
     if checkpoint_every < 1:
         raise ValueError("checkpoint_every must be at least 1.")
-
+    if max_generation_attempts < 1:
+        raise ValueError("max_generation_attempts must be at least 1.")
+    if max_turns_per_window < 1:
+        raise ValueError("max_turns_per_window must be at least 1.")
     train = _full_train_rows(frame)
+    known_texts = set(frame["text_seeker"].map(_text_duplicate_key))
     progress_path = output / "augmentation_progress.jsonl"
     completed: dict[int, dict[str, Any]] = {}
+    invalid_loaded_for_retry = 0
     if progress_path.exists():
         if not resume:
             raise RuntimeError(
@@ -509,7 +718,28 @@ def run_outcome_augmentation(
                 record = json.loads(line)
                 if record["plan_signature"] != signature:
                     raise RuntimeError("Existing progress belongs to another plan.")
-                completed[int(record["generation_index"])] = record
+                generation_index = int(record["generation_index"])
+                if bool(record.get("generation_valid")):
+                    try:
+                        source_index = int(plan[generation_index]["source_index"])
+                        _apply_novelty_gate(
+                            record["row"],
+                            train.loc[source_index],
+                            known_texts,
+                            min_changed_turn_share,
+                            max_source_text_similarity,
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        completed.pop(generation_index, None)
+                        invalid_loaded_for_retry += 1
+                    else:
+                        completed[generation_index] = record
+                        known_texts.add(_text_duplicate_key(record["row"]["text_seeker"]))
+                else:
+                    # Invalid generations are safe to retry: they never contribute
+                    # a synthetic row to the durable output dataset.
+                    completed.pop(generation_index, None)
+                    invalid_loaded_for_retry += 1
 
     pending = [
         item for item in plan if int(item["generation_index"]) not in completed
@@ -528,6 +758,7 @@ def run_outcome_augmentation(
         iterator = pending
 
     invalid = sum(not bool(item.get("generation_valid")) for item in completed.values())
+    report["invalid_loaded_for_retry"] = invalid_loaded_for_retry
     with progress_path.open("a", encoding="utf-8") as progress:
         since_flush = 0
         for item in iterator:
@@ -545,31 +776,50 @@ def run_outcome_augmentation(
                     preceding_supporter_turns.append(preceding_supporter)
             error: str | None = None
             generated_row: dict[str, Any] | None = None
-            try:
-                rewritten = _rewrite_seeker_turns(
-                    seeker_turns,
-                    preceding_supporter_turns,
-                    source,
-                    generator,
-                    int(item["generation_seed"]),
-                    max_prompt_words,
-                    max_tokens,
-                )
-                generated_row = _augmented_row(
-                    source,
-                    rewritten,
-                    int(item["generation_index"]),
-                    int(item["generation_seed"]),
-                    generator.name,
-                )
-            except (ValueError, json.JSONDecodeError) as generation_error:
+            attempts_used = 0
+            attempt_errors: list[str] = []
+            for attempt in range(max_generation_attempts):
+                attempts_used = attempt + 1
+                attempt_seed = int(item["generation_seed"]) + attempt * 1_000_003
+                try:
+                    rewritten = _rewrite_seeker_turns(
+                        seeker_turns,
+                        preceding_supporter_turns,
+                        source,
+                        generator,
+                        attempt_seed,
+                        max_prompt_words,
+                        max_tokens,
+                        max_turns_per_window,
+                    )
+                    generated_row = _augmented_row(
+                        source,
+                        rewritten,
+                        int(item["generation_index"]),
+                        attempt_seed,
+                        generator.name,
+                    )
+                    _apply_novelty_gate(
+                        generated_row,
+                        source,
+                        known_texts,
+                        min_changed_turn_share,
+                        max_source_text_similarity,
+                    )
+                    known_texts.add(_text_duplicate_key(generated_row["text_seeker"]))
+                    break
+                except (ValueError, json.JSONDecodeError) as generation_error:
+                    attempt_errors.append(str(generation_error))
+            if generated_row is None:
                 invalid += 1
-                error = str(generation_error)
+                error = attempt_errors[-1]
             record = {
                 "plan_signature": signature,
                 "generation_index": int(item["generation_index"]),
                 "generation_valid": generated_row is not None,
                 "error": error,
+                "attempts_used": attempts_used,
+                "attempt_errors": attempt_errors,
                 "row": _json_safe(generated_row),
             }
             completed[int(item["generation_index"])] = record
@@ -593,6 +843,8 @@ def run_outcome_augmentation(
         for _, record in sorted(completed.items())
         if record.get("generation_valid") and record.get("row") is not None
     ]
+    changed_shares = [float(row["changed_seeker_turn_share"]) for row in generated_rows]
+    source_similarities = [float(row["source_text_similarity"]) for row in generated_rows]
     parts = [original]
     if generated_rows:
         parts.append(pd.DataFrame(generated_rows))
@@ -613,6 +865,20 @@ def run_outcome_augmentation(
             ),
             "valid_generated_conversations": len(generated_rows),
             "invalid_generations": invalid,
+            "accepted_changed_turn_share_min": (
+                min(changed_shares) if changed_shares else None
+            ),
+            "accepted_changed_turn_share_mean": (
+                sum(changed_shares) / len(changed_shares) if changed_shares else None
+            ),
+            "accepted_source_text_similarity_max": (
+                max(source_similarities) if source_similarities else None
+            ),
+            "accepted_source_text_similarity_mean": (
+                sum(source_similarities) / len(source_similarities)
+                if source_similarities
+                else None
+            ),
             "output_path": str(output_path.resolve()),
             "output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
             "output_rows": len(augmented),

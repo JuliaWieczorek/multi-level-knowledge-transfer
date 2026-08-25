@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 
 def _append_matrix_progress(path: Path, event: dict[str, Any]) -> None:
@@ -62,7 +63,7 @@ def matrix_manifest(
     return [
         {
             "checkpoint": float(checkpoint),
-            "checkpoint_percent": int(round(float(checkpoint) * 100)),
+            "checkpoint_percent": round(float(checkpoint) * 100),
             "seed": int(seed),
             "label_scheme": label_scheme,
             **variant,
@@ -81,10 +82,12 @@ def run_experiment_matrix(
     checkpoints: Sequence[float],
     seeds: Sequence[int],
     skip_existing: bool = True,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     # Import lazily so manifest/dry-run commands work without torch.
-    from .training import train_temporal_model
     from tqdm.auto import tqdm
+
+    from .training import train_temporal_model
 
     source_root = Path(source_root)
     output_root = Path(output_root)
@@ -132,11 +135,28 @@ def run_experiment_matrix(
         )
         manifest_path = run_dir / "run_manifest.json"
         if skip_existing and manifest_path.exists():
-            skipped += 1
-            _append_matrix_progress(
-                progress_path, {"event": "run_skipped", **run}
-            )
-            continue
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                existing_manifest = json.load(handle)
+            expected_precision = str(config.get("precision", "fp32")).lower()
+            if existing_manifest.get("precision", "fp32") == expected_precision:
+                skipped += 1
+                _append_matrix_progress(
+                    progress_path, {"event": "run_skipped", **run}
+                )
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "status": "skipped",
+                            "run": run,
+                            "duration_seconds": float(
+                                existing_manifest.get("duration_seconds", 0.0)
+                            ),
+                            "completed": completed,
+                            "skipped": skipped,
+                            "planned": len(runs),
+                        }
+                    )
+                continue
         source_checkpoint = None
         if run["transfer"]:
             source_checkpoint = (
@@ -151,7 +171,7 @@ def run_experiment_matrix(
                 )
         _append_matrix_progress(progress_path, {"event": "run_started", **run})
         try:
-            train_temporal_model(
+            summary = train_temporal_model(
                 checkpoints_path=checkpoints_path,
                 output_dir=run_dir,
                 checkpoint=run["checkpoint"],
@@ -172,6 +192,17 @@ def run_experiment_matrix(
         _append_matrix_progress(
             progress_path, {"event": "run_completed", **run}
         )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "completed",
+                    "run": run,
+                    "duration_seconds": float(summary["duration_seconds"]),
+                    "completed": completed,
+                    "skipped": skipped,
+                    "planned": len(runs),
+                }
+            )
     return {
         "planned_runs": len(runs),
         "completed_runs": completed,

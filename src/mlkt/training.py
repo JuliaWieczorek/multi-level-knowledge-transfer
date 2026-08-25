@@ -6,9 +6,11 @@ import platform
 import random
 import sys
 import time
+from collections.abc import Iterable, Sequence
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -23,8 +25,8 @@ from .metrics import (
     classification_metrics,
     confusion_matrix_records,
     joint_prediction_diagnostics,
-    multilabel_per_label_metrics,
     multilabel_metrics,
+    multilabel_per_label_metrics,
     ordinal_metrics,
     per_class_metrics,
 )
@@ -70,6 +72,21 @@ def resolve_device(requested: str = "auto") -> torch.device:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
     return device
+
+
+def resolve_precision(requested: str, device: torch.device) -> str:
+    precision = requested.lower()
+    if precision not in {"fp32", "bf16"}:
+        raise ValueError("precision must be either 'fp32' or 'bf16'.")
+    if precision == "bf16" and device.type != "cuda":
+        raise RuntimeError("BF16 training requires a CUDA/HIP GPU device.")
+    return precision
+
+
+def _autocast_context(device: torch.device, precision: str):
+    if precision == "bf16":
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def _class_weights(
@@ -184,6 +201,7 @@ def _run_source_epoch(
     collect_predictions: bool = False,
     progress_description: str | None = None,
     progress_position: int = 0,
+    precision: str = "fp32",
 ) -> tuple[dict[str, float], pd.DataFrame | None, dict[str, np.ndarray] | None]:
     training = optimizer is not None
     model.train(training)
@@ -238,16 +256,17 @@ def _run_source_epoch(
                         }
                     )
             batch = _move_tensors(raw_batch, device)
-            outputs = model(batch["input_ids"], batch["attention_mask"])
-            loss, loss_parts = _source_loss(
-                model,
-                outputs,
-                batch,
-                sentiment_loss,
-                emotion_loss,
-                task_weights,
-                soft_sharing_lambda,
-            )
+            with _autocast_context(device, precision):
+                outputs = model(batch["input_ids"], batch["attention_mask"])
+                loss, loss_parts = _source_loss(
+                    model,
+                    outputs,
+                    batch,
+                    sentiment_loss,
+                    emotion_loss,
+                    task_weights,
+                    soft_sharing_lambda,
+                )
             if training:
                 optimizer.zero_grad()
                 loss.backward()
@@ -536,8 +555,12 @@ def pretrain_source_mtl(
         raise ValueError("Source data requires train and validation rows.")
 
     device = resolve_device(config.get("device", "auto"))
+    precision = resolve_precision(config.get("precision", "fp32"), device)
     model_name = config["transformer_name"]
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    local_files_only = bool(config.get("local_files_only", False))
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, local_files_only=local_files_only
+    )
     train_dataset = SourceMTLDataset(
         train, tokenizer, emotion_names, max_length=config["max_length"]
     )
@@ -562,6 +585,7 @@ def pretrain_source_mtl(
         transformer_name=model_name,
         num_emotions=len(emotion_names),
         dropout=config["dropout"],
+        local_files_only=local_files_only,
     ).to(device)
     sentiment_weights = _class_weights(
         train["sentiment"].map({"negative": 0, "neutral": 1, "positive": 2}),
@@ -626,6 +650,7 @@ def pretrain_source_mtl(
                 "split_hash": source_split_hash,
                 "emotion_names": emotion_names,
                 "emotion_threshold": emotion_threshold,
+                "precision": precision,
                 "class_weights": {
                     "sentiment": sentiment_weights.detach().cpu().tolist(),
                     "emotion_alpha": emotion_alpha.detach().cpu().tolist(),
@@ -673,6 +698,7 @@ def pretrain_source_mtl(
             scheduler,
             progress_description=f"seed {seed} epoch {epoch} train",
             progress_position=progress_position + 1,
+            precision=precision,
         )
         validation_metrics, validation_predictions, validation_details = _run_source_epoch(
             model,
@@ -687,6 +713,7 @@ def pretrain_source_mtl(
             collect_predictions=True,
             progress_description=f"seed {seed} epoch {epoch} validation",
             progress_position=progress_position + 1,
+            precision=precision,
         )
         history.append(
             {
@@ -785,6 +812,7 @@ def pretrain_source_mtl(
         "split_hash": source_split_hash,
         "emotion_names": emotion_names,
         "device": str(device),
+        "precision": precision,
         "emotion_threshold": emotion_threshold,
         "input_report": input_report,
         "duration_seconds": time.time() - started_at,
@@ -825,6 +853,7 @@ def _run_temporal_epoch(
     progress_description: str | None = None,
     progress_position: int = 0,
     label_scheme: str = "original4",
+    precision: str = "fp32",
 ) -> tuple[dict[str, float], pd.DataFrame]:
     training = optimizer is not None
     model.train(training)
@@ -857,14 +886,15 @@ def _run_temporal_epoch(
             final_raw_values.extend(raw_batch["final_target_raw"].tolist())
             drop_raw_values.extend(raw_batch["drop_target_raw"].tolist())
             batch = _move_tensors(raw_batch, device)
-            outputs = model(batch)
-            loss, loss_parts = temporal_multitask_loss(
-                outputs,
-                batch["final_target"],
-                batch["drop_target"],
-                final_weights,
-                drop_weights,
-            )
+            with _autocast_context(device, precision):
+                outputs = model(batch)
+                loss, loss_parts = temporal_multitask_loss(
+                    outputs,
+                    batch["final_target"],
+                    batch["drop_target"],
+                    final_weights,
+                    drop_weights,
+                )
             if training:
                 optimizer.zero_grad()
                 loss.backward()
@@ -980,8 +1010,12 @@ def train_temporal_model(
         )
         source_checkpoint_hash = _file_hash(transfer_checkpoint_path)
     device = resolve_device(config.get("device", "auto"))
+    precision = resolve_precision(config.get("precision", "fp32"), device)
+    local_files_only = bool(config.get("local_files_only", False))
     tokenizer = (
-        AutoTokenizer.from_pretrained(config["transformer_name"])
+        AutoTokenizer.from_pretrained(
+            config["transformer_name"], local_files_only=local_files_only
+        )
         if "text" in modality
         else None
     )
@@ -1040,6 +1074,7 @@ def train_temporal_model(
         max_chunks=config["max_chunks"],
         use_initial_intensity=use_initial_intensity,
         num_outcome_classes=scheme.num_classes,
+        local_files_only=local_files_only,
     ).to(device)
     run_config = {
         "run_type": "temporal",
@@ -1049,6 +1084,7 @@ def train_temporal_model(
         "seed": seed,
         "use_initial_intensity": use_initial_intensity,
         "label_scheme": scheme.to_manifest(),
+        "precision": precision,
         "initial_intensity_standardization": (
             {"mean": initial_mean, "std": initial_std, "source": "train_only"}
             if use_initial_intensity
@@ -1109,7 +1145,7 @@ def train_temporal_model(
     )
     history: list[dict[str, Any]] = []
     run_label = (
-        f"Target {int(round(checkpoint * 100))}% {modality} seed {seed}"
+        f"Target {round(checkpoint * 100)}% {modality} seed {seed}"
         + (" +initial" if use_initial_intensity else "")
     )
     epoch_iterator = tqdm(
@@ -1133,6 +1169,7 @@ def train_temporal_model(
             progress_description=f"epoch {epoch} train",
             progress_position=progress_position + 1,
             label_scheme=scheme.name,
+            precision=precision,
         )
         validation_metrics, _ = _run_temporal_epoch(
             model,
@@ -1143,6 +1180,7 @@ def train_temporal_model(
             progress_description=f"epoch {epoch} validation",
             progress_position=progress_position + 1,
             label_scheme=scheme.name,
+            precision=precision,
         )
         score = (
             validation_metrics["final_f1_macro"]
@@ -1191,10 +1229,11 @@ def train_temporal_model(
             progress_description=f"{run_label} final {split_name}",
             progress_position=progress_position + 1,
             label_scheme=scheme.name,
+            precision=precision,
         )
         predictions["split"] = split_name
         predictions["checkpoint"] = checkpoint
-        predictions["checkpoint_percent"] = int(round(checkpoint * 100))
+        predictions["checkpoint_percent"] = round(checkpoint * 100)
         predictions["modality"] = modality
         predictions["transfer"] = transfer_checkpoint is not None
         predictions["use_initial_intensity"] = use_initial_intensity
@@ -1235,7 +1274,7 @@ def train_temporal_model(
             metric_rows.append(
                 {
                     "checkpoint": checkpoint,
-                    "checkpoint_percent": int(round(checkpoint * 100)),
+                    "checkpoint_percent": round(checkpoint * 100),
                     "split": split_name,
                     "target": target,
                     "modality": modality,
@@ -1282,8 +1321,15 @@ def train_temporal_model(
         ),
         "source_checkpoint_sha256": source_checkpoint_hash,
         "device": str(device),
+        "precision": precision,
         "duration_seconds": time.time() - started_at,
+        "best_model_retained": bool(config.get("retain_best_model", False)),
     }
+    if not summary["best_model_retained"]:
+        # Predictions, metrics, diagnostics, and history are the durable research
+        # outputs. Retaining every target state dict adds roughly 100 GiB across
+        # the full experiment matrix without being used by the reporting stage.
+        model_path.unlink(missing_ok=True)
     with (output / "run_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     _append_progress(progress_path, {"event": "run_completed", **summary})

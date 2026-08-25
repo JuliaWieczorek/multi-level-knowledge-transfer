@@ -489,17 +489,95 @@ class TextGenerator(Protocol):
         ...
 
 
+DEFAULT_GGUF_REPO = "bartowski/Qwen2.5-7B-Instruct-GGUF"
+DEFAULT_GGUF_FILENAME = "Qwen2.5-7B-Instruct-Q5_K_M.gguf"
+DEFAULT_GGUF_REVISION = "8911e8a47f92bac19d6f5c64a2e2095bd2f7d031"
+
+
+def _json_array_schema_from_prompt(prompt: str) -> str | None:
+    match = re.search(r"valid JSON array of exactly (\d+) strings", prompt)
+    if match is None:
+        return None
+    count = int(match.group(1))
+    return json.dumps(
+        {
+            "type": "array",
+            "minItems": count,
+            "maxItems": count,
+            "items": {"type": "string"},
+        }
+    )
+
+
+def resolve_gguf_model_path(
+    model_path: str | Path | None = None,
+    *,
+    hf_repo: str | None = None,
+    hf_filename: str | None = None,
+    hf_revision: str | None = None,
+    cache_dir: str | Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve a local GGUF or download one once into the Hugging Face cache."""
+    if model_path is not None:
+        resolved = Path(model_path).expanduser().resolve()
+        if not resolved.is_file():
+            raise ValueError(f"Model path does not exist: {resolved}")
+        return resolved, {
+            "source": "local",
+            "hf_repo": None,
+            "hf_filename": None,
+            "hf_revision": None,
+        }
+
+    repo = hf_repo or DEFAULT_GGUF_REPO
+    filename = hf_filename or DEFAULT_GGUF_FILENAME
+    revision = hf_revision or DEFAULT_GGUF_REVISION
+    resolved_cache = Path(cache_dir).expanduser().resolve() if cache_dir else None
+    if resolved_cache is not None:
+        resolved_cache.mkdir(parents=True, exist_ok=True)
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as error:
+        raise RuntimeError(
+            "Automatic GGUF download requires huggingface-hub. "
+            "Install the 'augmentation' optional dependency or pass --model-path."
+        ) from error
+    print(f"Resolving GGUF from Hugging Face cache: {repo}/{filename}")
+    downloaded = Path(
+        hf_hub_download(
+            repo_id=repo,
+            filename=filename,
+            revision=revision,
+            cache_dir=str(resolved_cache) if resolved_cache else None,
+        )
+    ).resolve()
+    return downloaded, {
+        "source": "huggingface_cache",
+        "hf_repo": repo,
+        "hf_filename": filename,
+        "hf_revision": revision,
+        "cache_dir": str(resolved_cache) if resolved_cache else None,
+    }
+
+
 class LlamaCppGenerator:
-    name = "llama-2-7b-chat-gguf"
+    """Chat-template-aware GGUF generator backed by llama.cpp."""
 
     def __init__(
         self,
-        model_path: str | Path,
+        model_path: str | Path | None = None,
+        *,
+        hf_repo: str | None = None,
+        hf_filename: str | None = None,
+        hf_revision: str | None = None,
+        cache_dir: str | Path | None = None,
         context_size: int = 2048,
         threads: int = 8,
         gpu_layers: int = -1,
         batch_size: int = 1024,
         require_gpu: bool = False,
+        temperature: float = 0.5,
+        top_p: float = 0.9,
     ) -> None:
         try:
             import llama_cpp
@@ -509,9 +587,13 @@ class LlamaCppGenerator:
                 "Llama generation requires llama-cpp-python. "
                 "Install the 'augmentation' optional dependency."
             ) from error
-        model_path = Path(model_path).resolve()
-        if not model_path.is_file():
-            raise ValueError(f"Model path does not exist: {model_path}")
+        model_path, model_source = resolve_gguf_model_path(
+            model_path,
+            hf_repo=hf_repo,
+            hf_filename=hf_filename,
+            hf_revision=hf_revision,
+            cache_dir=cache_dir,
+        )
         system_info = llama_cpp.llama_print_system_info().decode(
             errors="replace"
         )
@@ -564,6 +646,14 @@ class LlamaCppGenerator:
             offload_kqv=True,
             verbose=False,
         )
+        model_name = str(
+            self._model.metadata.get("general.name")
+            or self._model.metadata.get("general.basename")
+            or model_path.stem
+        )
+        self.name = f"llama-cpp:{model_name}"
+        self._temperature = float(temperature)
+        self._top_p = float(top_p)
         model_layers = int(llama_cpp.llama_model_n_layer(self._model.model))
         gpu_layers_effective = (
             model_layers if gpu_layers < 0 else min(gpu_layers, model_layers)
@@ -583,6 +673,10 @@ class LlamaCppGenerator:
             "context_size": context_size,
             "threads": threads,
             "model_path": str(model_path),
+            "model_name": model_name,
+            "temperature": self._temperature,
+            "top_p": self._top_p,
+            **model_source,
             "system_info": system_info,
             "native_libraries": sorted(native_libraries),
         }
@@ -591,15 +685,33 @@ class LlamaCppGenerator:
         return dict(self._metadata)
 
     def generate(self, prompt: str, max_tokens: int, seed: int) -> str:
-        output = self._model(
-            prompt,
+        grammar = None
+        schema = _json_array_schema_from_prompt(prompt)
+        if schema is not None:
+            from llama_cpp import LlamaGrammar
+
+            grammar = LlamaGrammar.from_json_schema(schema, verbose=False)
+        output = self._model.create_chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You rewrite emotional-support dialogue text while "
+                        "preserving facts, intent, and emotional trajectory. "
+                        "Return only the exact JSON format requested by the user."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
             max_tokens=max_tokens,
-            temperature=0.8,
-            top_p=0.9,
+            temperature=self._temperature,
+            top_p=self._top_p,
             seed=seed,
             stop=["Original:", "Rules:", "\n\n\n"],
+            grammar=grammar,
         )
-        return str(output["choices"][0]["text"]).strip()
+        message = output["choices"][0]["message"]
+        return str(message["content"]).strip()
 
 
 class DeterministicMockGenerator:
