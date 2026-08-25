@@ -108,6 +108,32 @@ class NeuralContractTests(unittest.TestCase):
         self.assertEqual(output["final_intensity"].shape, (1, 4))
         self.assertEqual(output["drop_magnitude"].shape, (1, 4))
 
+    def test_temporal_model_supports_coarse_three_class_heads(self):
+        import torch
+
+        from mlkt.models import TemporalMultiModalModel
+
+        model = TemporalMultiModalModel(
+            modality="strategy",
+            transformer_name="unused",
+            transfer_checkpoint=None,
+            strategy_vocabulary_size=10,
+            strategy_numeric_size=4,
+            strategy_hidden_size=32,
+            dropout=0.0,
+            num_outcome_classes=3,
+        )
+        output = model(
+            {
+                "strategy_ids": torch.tensor([[1]]),
+                "strategy_positions": torch.tensor([[0.0]]),
+                "strategy_mask": torch.tensor([[True]]),
+                "strategy_numeric": torch.zeros((1, 4)),
+            }
+        )
+        self.assertEqual(output["final_intensity"].shape, (1, 3))
+        self.assertEqual(output["drop_magnitude"].shape, (1, 3))
+
     def test_ordinal_encoding_and_decoding_enforce_valid_drop(self):
         import torch
 

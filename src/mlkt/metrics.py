@@ -16,6 +16,8 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+from .outcome_labels import ORIGINAL_4, get_outcome_label_scheme
+
 
 def classification_metrics(
     y_true: Iterable[Any],
@@ -197,6 +199,7 @@ def joint_prediction_diagnostics(
     final_prediction: Iterable[int],
     drop_target: Iterable[int],
     drop_prediction: Iterable[int],
+    label_scheme: str = ORIGINAL_4,
 ) -> tuple[dict[str, float], dict[str, np.ndarray]]:
     initial = np.asarray(list(initial_intensity), dtype=int)
     final = np.asarray(list(final_prediction), dtype=int)
@@ -207,19 +210,75 @@ def joint_prediction_diagnostics(
         and initial.size > 0
     ):
         raise ValueError("Joint diagnostic inputs must be non-empty and equal length.")
-    consistent = final + drop_pred == initial
-    derived_drop = initial - final
-    derived_valid = (derived_drop >= 1) & (derived_drop <= 4)
+    scheme = get_outcome_label_scheme(label_scheme)
+    if scheme.name == ORIGINAL_4:
+        consistent = final + drop_pred == initial
+        derived_drop = initial - final
+        derived_valid = (derived_drop >= 1) & (derived_drop <= 4)
+        derived_matches_target = derived_drop == drop_true
+        derived_error = np.abs(derived_drop - drop_true)
+        derived_min = derived_drop.copy()
+        derived_max = derived_drop.copy()
+    else:
+        consistent_values: list[bool] = []
+        derived_valid_values: list[bool] = []
+        derived_matches: list[bool] = []
+        derived_errors: list[float] = []
+        derived_min_values: list[int] = []
+        derived_max_values: list[int] = []
+        for initial_value, final_label, true_drop, predicted_drop in zip(
+            initial, final, drop_true, drop_pred
+        ):
+            final_raw = scheme.raw_groups[int(final_label)]
+            predicted_drop_raw = scheme.raw_groups[int(predicted_drop)]
+            consistent_values.append(
+                any(
+                    raw_final + raw_drop == int(initial_value)
+                    for raw_final in final_raw
+                    for raw_drop in predicted_drop_raw
+                )
+            )
+            possible_raw_drops = [
+                int(initial_value) - raw_final
+                for raw_final in final_raw
+                if 1 <= int(initial_value) - raw_final <= 5
+            ]
+            possible_labels = sorted(
+                {
+                    label
+                    for label, raw_values in scheme.raw_groups.items()
+                    if any(value in raw_values for value in possible_raw_drops)
+                }
+            )
+            valid = bool(possible_labels)
+            derived_valid_values.append(valid)
+            derived_matches.append(int(true_drop) in possible_labels)
+            derived_errors.append(
+                float(min(abs(label - int(true_drop)) for label in possible_labels))
+                if valid
+                else float(scheme.num_classes)
+            )
+            derived_min_values.append(min(possible_labels) if valid else 0)
+            derived_max_values.append(max(possible_labels) if valid else 0)
+        consistent = np.asarray(consistent_values, dtype=bool)
+        derived_valid = np.asarray(derived_valid_values, dtype=bool)
+        derived_matches_target = np.asarray(derived_matches, dtype=bool)
+        derived_error = np.asarray(derived_errors, dtype=float)
+        derived_min = np.asarray(derived_min_values, dtype=int)
+        derived_max = np.asarray(derived_max_values, dtype=int)
+        derived_drop = np.where(derived_min == derived_max, derived_min, 0)
     metrics = {
         "joint_consistency_rate": float(consistent.mean()),
-        "derived_drop_accuracy": float((derived_drop == drop_true).mean()),
-        "derived_drop_mae": float(np.mean(np.abs(derived_drop - drop_true))),
+        "derived_drop_accuracy": float(derived_matches_target.mean()),
+        "derived_drop_mae": float(np.mean(derived_error)),
         "invalid_derived_drop_rate": float((~derived_valid).mean()),
     }
     arrays = {
         "joint_consistent": consistent,
         "derived_drop_prediction": derived_drop,
         "derived_drop_valid": derived_valid,
+        "derived_drop_prediction_min": derived_min,
+        "derived_drop_prediction_max": derived_max,
     }
     return metrics, arrays
 

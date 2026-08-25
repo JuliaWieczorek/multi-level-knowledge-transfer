@@ -5,6 +5,18 @@ from typing import Any
 import pandas as pd
 
 from .metrics import classification_metrics, ordinal_metrics
+from .outcome_labels import ORIGINAL_4, get_outcome_label_scheme
+
+
+def _label_context(frame: pd.DataFrame, task: str) -> tuple[tuple[int, ...] | None, str]:
+    if task not in {"final_intensity", "drop_magnitude"}:
+        return None, ORIGINAL_4
+    scheme_name = (
+        str(frame["label_scheme"].iloc[0])
+        if "label_scheme" in frame and not frame.empty
+        else ORIGINAL_4
+    )
+    return get_outcome_label_scheme(scheme_name).labels, scheme_name
 
 
 def run_naive_baselines(
@@ -32,13 +44,13 @@ def run_naive_baselines(
         predictors: dict[str, Any] = {"majority": [majority] * len(test)}
 
         for model_name, predicted in predictors.items():
-            labels = (1, 2, 3, 4) if task in {"final_intensity", "drop_magnitude"} else None
+            labels, label_scheme = _label_context(frame, task)
             scores = classification_metrics(
                 test[target_column], predicted, labels=labels
             )
             if task in {"final_intensity", "drop_magnitude"}:
                 scores.update(
-                    ordinal_metrics(test[target_column], predicted, labels=(1, 2, 3, 4))
+                    ordinal_metrics(test[target_column], predicted, labels=labels)
                 )
             metric_rows.append(
                 {
@@ -47,6 +59,7 @@ def run_naive_baselines(
                     "split": "test",
                     "task": task,
                     "model": model_name,
+                    "label_scheme": label_scheme,
                     **scores,
                 }
             )
@@ -58,6 +71,7 @@ def run_naive_baselines(
             predictions["split"] = "test"
             predictions["task"] = task
             predictions["model"] = model_name
+            predictions["label_scheme"] = label_scheme
             prediction_frames.append(predictions)
     return pd.DataFrame(metric_rows), pd.concat(prediction_frames, ignore_index=True)
 
@@ -136,14 +150,14 @@ def run_tfidf_baseline(
         model.fit(train[text_column].fillna(""), train[target_column])
         for split_name, split_frame in (("validation", validation), ("test", test)):
             predicted = model.predict(split_frame[text_column].fillna(""))
-            labels = (1, 2, 3, 4) if task in {"final_intensity", "drop_magnitude"} else None
+            labels, label_scheme = _label_context(frame, task)
             scores = classification_metrics(
                 split_frame[target_column], predicted, labels=labels
             )
             if task in {"final_intensity", "drop_magnitude"}:
                 scores.update(
                     ordinal_metrics(
-                        split_frame[target_column], predicted, labels=(1, 2, 3, 4)
+                        split_frame[target_column], predicted, labels=labels
                     )
                 )
             metric_rows.append(
@@ -153,6 +167,7 @@ def run_tfidf_baseline(
                     "split": split_name,
                     "task": task,
                     "model": "tfidf_logistic_regression",
+                    "label_scheme": label_scheme,
                     **scores,
                 }
             )
@@ -164,6 +179,7 @@ def run_tfidf_baseline(
             predictions["split"] = split_name
             predictions["task"] = task
             predictions["model"] = "tfidf_logistic_regression"
+            predictions["label_scheme"] = label_scheme
             prediction_frames.append(predictions)
     return pd.DataFrame(metric_rows), pd.concat(prediction_frames, ignore_index=True)
 
@@ -205,12 +221,11 @@ def run_initial_only_baseline(
             )
             model.fit(train[["initial_intensity"]], train[target_column])
             predicted = model.predict(subset[["initial_intensity"]])
-            scores = classification_metrics(
-                subset[target_column], predicted, labels=(1, 2, 3, 4)
-            )
+            labels, label_scheme = _label_context(frame, task)
+            scores = classification_metrics(subset[target_column], predicted, labels=labels)
             scores.update(
                 ordinal_metrics(
-                    subset[target_column], predicted, labels=(1, 2, 3, 4)
+                    subset[target_column], predicted, labels=labels
                 )
             )
             metric_rows.append(
@@ -220,6 +235,7 @@ def run_initial_only_baseline(
                     "split": split_name,
                     "task": task,
                     "model": "initial_only_logistic_regression",
+                    "label_scheme": label_scheme,
                     **scores,
                 }
             )
@@ -231,6 +247,7 @@ def run_initial_only_baseline(
             predictions["split"] = split_name
             predictions["task"] = task
             predictions["model"] = "initial_only_logistic_regression"
+            predictions["label_scheme"] = label_scheme
             prediction_frames.append(predictions)
     return pd.DataFrame(metric_rows), pd.concat(prediction_frames, ignore_index=True)
 
@@ -267,6 +284,8 @@ def run_outcome_metadata_baselines(
     if subset.empty:
         raise ValueError(f"No rows found for checkpoint {checkpoint}.")
     train = subset[subset["split"] == "train"]
+    _, label_scheme = _label_context(frame, "final_intensity")
+    scheme = get_outcome_label_scheme(label_scheme)
     specifications = {
         "initial": ["initial_intensity"],
         "emotion": ["emotion_family"],
@@ -300,18 +319,27 @@ def run_outcome_metadata_baselines(
                 ),
             ]
         )
-        model.fit(train[feature_columns], train["final_intensity"])
         for split_name in ("validation", "test"):
             split_frame = subset[subset["split"] == split_name]
-            final_prediction = model.predict(split_frame[feature_columns]).astype(int)
-            # All supervised rows represent a decrease, so final must be below initial.
-            final_prediction = final_prediction.clip(1, 4)
-            final_prediction = pd.Series(
-                final_prediction, index=split_frame.index
-            ).clip(upper=split_frame["initial_intensity"] - 1).astype(int)
+            task_predictions: dict[str, pd.Series] = {}
+            for task in ("final_intensity", "drop_magnitude"):
+                task_model = model
+                task_model.fit(train[feature_columns], train[task])
+                predicted = pd.Series(
+                    task_model.predict(split_frame[feature_columns]).astype(int),
+                    index=split_frame.index,
+                )
+                if scheme.name == ORIGINAL_4 and task == "final_intensity":
+                    predicted = predicted.clip(1, 4).clip(
+                        upper=split_frame["initial_intensity"] - 1
+                    ).astype(int)
+                task_predictions[task] = predicted
+            final_prediction = task_predictions["final_intensity"]
             drop_prediction = (
-                split_frame["initial_intensity"] - final_prediction
-            ).astype(int)
+                (split_frame["initial_intensity"] - final_prediction).astype(int)
+                if scheme.name == ORIGINAL_4
+                else task_predictions["drop_magnitude"]
+            )
             predictions = split_frame[
                 [
                     "dataset",
@@ -328,6 +356,7 @@ def run_outcome_metadata_baselines(
             predictions["drop_prediction"] = drop_prediction
             predictions["split"] = split_name
             predictions["model"] = model_name
+            predictions["label_scheme"] = scheme.name
             prediction_frames.append(predictions)
             for task, target, predicted in (
                 (
@@ -337,8 +366,8 @@ def run_outcome_metadata_baselines(
                 ),
                 ("drop_magnitude", split_frame["drop_magnitude"], drop_prediction),
             ):
-                scores = classification_metrics(target, predicted, labels=(1, 2, 3, 4))
-                scores.update(ordinal_metrics(target, predicted, labels=(1, 2, 3, 4)))
+                scores = classification_metrics(target, predicted, labels=scheme.labels)
+                scores.update(ordinal_metrics(target, predicted, labels=scheme.labels))
                 metric_rows.append(
                     {
                         "checkpoint": checkpoint,
@@ -346,6 +375,7 @@ def run_outcome_metadata_baselines(
                         "split": split_name,
                         "task": task,
                         "model": model_name,
+                        "label_scheme": scheme.name,
                         **scores,
                     }
                 )

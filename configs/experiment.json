@@ -94,7 +94,7 @@
     "transformer_name": "bert-base-uncased",
     "max_length": 128,
     "max_chunks": 32,
-    "batch_size": 4,
+    "batch_size": 8,
     "epochs": 10,
     "learning_rate": 0.00002,
     "weight_decay": 0.01,

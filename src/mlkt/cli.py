@@ -102,6 +102,7 @@ def baseline(args: argparse.Namespace) -> None:
         run_naive_baselines,
         run_tfidf_baseline,
     )
+    from .outcome_labels import relabel_outcome_frame
 
     input_path = Path(
         args.input
@@ -111,6 +112,8 @@ def baseline(args: argparse.Namespace) -> None:
         / f"{args.dataset}_checkpoints.csv"
     )
     frame = pd.read_csv(input_path)
+    if args.task in {"final_intensity", "drop_magnitude"}:
+        frame = relabel_outcome_frame(frame, args.label_scheme)
     if args.model == "naive":
         metrics, predictions = run_naive_baselines(frame, task=args.task)
     elif args.model == "initial":
@@ -121,9 +124,12 @@ def baseline(args: argparse.Namespace) -> None:
         metrics, predictions = run_tfidf_baseline(
             frame, task=args.task, text_column=args.text_column, seed=args.seed
         )
-    output_dir = Path(args.output_dir or PROJECT_ROOT / "outputs" / "baseline")
+    default_dir = "baseline_coarse3" if args.label_scheme == "coarse3" else "baseline"
+    output_dir = Path(args.output_dir or PROJECT_ROOT / "outputs" / default_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{args.dataset}_{args.task}_{args.model}_{args.text_column}"
+    if args.label_scheme != "original4":
+        stem = f"{stem}_{args.label_scheme}"
     metrics_path = output_dir / f"{stem}_metrics.csv"
     predictions_path = output_dir / f"{stem}_predictions.csv"
     metrics.to_csv(metrics_path, index=False)
@@ -135,6 +141,7 @@ def baseline(args: argparse.Namespace) -> None:
 
 def outcome_baselines(args: argparse.Namespace) -> None:
     from .baseline import run_outcome_metadata_baselines
+    from .outcome_labels import relabel_outcome_frame
 
     config_path = Path(args.config).resolve()
     config = _load_config(config_path)
@@ -145,13 +152,17 @@ def outcome_baselines(args: argparse.Namespace) -> None:
         )
     )
     frame = pd.read_csv(input_path)
+    frame = relabel_outcome_frame(frame, args.label_scheme)
     metrics, predictions = run_outcome_metadata_baselines(
         frame, checkpoint=1.0, seed=args.seed
+    )
+    default_baseline_name = (
+        "baselines_coarse3" if args.label_scheme == "coarse3" else "baselines"
     )
     output_dir = Path(
         args.output_dir
         or _config_output_path(config["outcome_ceiling"]["output_dir"], config_path)
-        / "baselines"
+        / default_baseline_name
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metadata_metrics.csv"
@@ -406,7 +417,9 @@ def train_temporal(args: argparse.Namespace) -> None:
 
     config_path = Path(args.config).resolve()
     config = _load_config(config_path)
-    temporal = config["temporal"]
+    temporal = dict(config["temporal"])
+    if args.label_scheme is not None:
+        temporal["label_scheme"] = args.label_scheme
     if args.modality == "strategy" and args.transfer:
         raise ValueError(
             "Strategy-only has no text encoder and therefore no transfer variant."
@@ -537,11 +550,33 @@ def run_matrix(args: argparse.Namespace) -> None:
 
     config_path = Path(args.config).resolve()
     config = _load_config(config_path)
-    runs = matrix_manifest(config["checkpoints"], config["seeds"])
+    temporal = dict(config["temporal"])
+    if args.label_scheme is not None:
+        temporal["label_scheme"] = args.label_scheme
+    checkpoints = (
+        [value / 100.0 if value > 1 else value for value in args.checkpoints]
+        if args.checkpoints
+        else config["checkpoints"]
+    )
+    seeds = args.seeds or config["seeds"]
+    runs = matrix_manifest(
+        checkpoints,
+        seeds,
+        label_scheme=temporal.get("label_scheme", "original4"),
+    )
     if args.dry_run:
         print(json.dumps(runs, indent=2))
         print(f"\nPlanned runs: {len(runs)}")
         return
+    configured_output = _config_output_path(
+        config["temporal"]["output_dir"], config_path
+    )
+    if args.output_dir:
+        output_root = Path(args.output_dir)
+    elif temporal.get("label_scheme", "original4") == "coarse3":
+        output_root = configured_output.with_name(f"{configured_output.name}_coarse3")
+    else:
+        output_root = configured_output
     result = run_experiment_matrix(
         checkpoints_path=_resolve_config_path(
             config["transfer"]["esconv_checkpoints_path"], config_path
@@ -549,11 +584,10 @@ def run_matrix(args: argparse.Namespace) -> None:
         source_root=_config_output_path(
             config["source_mtl"]["output_dir"], config_path
         ),
-        output_root=args.output_dir
-        or _config_output_path(config["temporal"]["output_dir"], config_path),
-        config=config["temporal"],
-        checkpoints=config["checkpoints"],
-        seeds=config["seeds"],
+        output_root=output_root,
+        config=temporal,
+        checkpoints=checkpoints,
+        seeds=seeds,
         skip_existing=not args.overwrite,
     )
     print(json.dumps(result, indent=2))
@@ -587,8 +621,11 @@ def analyze_strategies(args: argparse.Namespace) -> None:
         associations = retrospective_ordinal_analysis(
             frame,
             output / "retrospective",
-            bootstrap_samples=args.bootstrap_samples
-            or config["strategy_analysis"]["bootstrap_samples"],
+            bootstrap_samples=(
+                args.bootstrap_samples
+                if args.bootstrap_samples is not None
+                else config["strategy_analysis"]["bootstrap_samples"]
+            ),
             seed=args.seed,
         )
         results["retrospective_associations"] = len(associations)
@@ -605,6 +642,17 @@ def report(args: argparse.Namespace) -> None:
         or _config_output_path(config["temporal"]["output_dir"], config_path),
         output_dir=args.output_dir
         or _config_output_path(config["reporting"]["output_dir"], config_path),
+    )
+    print(json.dumps(manifest, indent=2))
+
+
+def compare_label_schemes(args: argparse.Namespace) -> None:
+    from .reporting import compare_label_scheme_reports
+
+    manifest = compare_label_scheme_reports(
+        original_report_dir=args.original_report,
+        coarse_report_dir=args.coarse_report,
+        output_dir=args.output_dir,
     )
     print(json.dumps(manifest, indent=2))
 
@@ -640,6 +688,9 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_parser.add_argument("--input")
     baseline_parser.add_argument("--output-dir")
     baseline_parser.add_argument("--seed", type=int, default=42)
+    baseline_parser.add_argument(
+        "--label-scheme", choices=("original4", "coarse3"), default="original4"
+    )
     baseline_parser.set_defaults(function=baseline)
 
     outcome_baseline_parser = subparsers.add_parser("outcome-baselines")
@@ -647,6 +698,9 @@ def build_parser() -> argparse.ArgumentParser:
     outcome_baseline_parser.add_argument("--input")
     outcome_baseline_parser.add_argument("--output-dir")
     outcome_baseline_parser.add_argument("--seed", type=int, default=42)
+    outcome_baseline_parser.add_argument(
+        "--label-scheme", choices=("original4", "coarse3"), default="original4"
+    )
     outcome_baseline_parser.set_defaults(function=outcome_baselines)
 
     transfer_parser = subparsers.add_parser("prepare-transfer")
@@ -723,6 +777,9 @@ def build_parser() -> argparse.ArgumentParser:
     transfer_group.add_argument("--vanilla", action="store_true")
     temporal_parser.add_argument("--source-checkpoint")
     temporal_parser.add_argument("--use-initial-intensity", action="store_true")
+    temporal_parser.add_argument(
+        "--label-scheme", choices=("original4", "coarse3")
+    )
     temporal_parser.set_defaults(function=train_temporal)
 
     outcome_parser = subparsers.add_parser("train-outcome-ceiling")
@@ -771,6 +828,22 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_parser.add_argument("--output-dir")
     matrix_parser.add_argument("--dry-run", action="store_true")
     matrix_parser.add_argument("--overwrite", action="store_true")
+    matrix_parser.add_argument(
+        "--label-scheme", choices=("original4", "coarse3")
+    )
+    matrix_parser.add_argument(
+        "--checkpoints",
+        nargs="+",
+        type=float,
+        choices=(0.1, 0.25, 0.5, 0.75, 1.0, 10, 25, 50, 75, 100),
+        help="Optional subset for a pilot run, for example --checkpoints 100.",
+    )
+    matrix_parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        help="Optional seed subset for a pilot run.",
+    )
     matrix_parser.set_defaults(function=run_matrix)
 
     strategy_parser = subparsers.add_parser("analyze-strategies")
@@ -789,6 +862,12 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--experiments")
     report_parser.add_argument("--output-dir")
     report_parser.set_defaults(function=report)
+
+    comparison_parser = subparsers.add_parser("compare-label-schemes")
+    comparison_parser.add_argument("--original-report", required=True)
+    comparison_parser.add_argument("--coarse-report", required=True)
+    comparison_parser.add_argument("--output-dir", required=True)
+    comparison_parser.set_defaults(function=compare_label_schemes)
     return parser
 
 

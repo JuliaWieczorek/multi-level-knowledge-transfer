@@ -232,6 +232,9 @@ def _plot_nested_strategy_curves(
     metrics: pd.DataFrame, output_dir: Path
 ) -> list[str]:
     try:
+        import matplotlib
+
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         return []
@@ -276,6 +279,33 @@ def benjamini_hochberg(p_values: Iterable[float]) -> np.ndarray:
     return result
 
 
+def _independent_columns_without_constant(design: pd.DataFrame) -> list[str]:
+    """Select full-rank columns whose span does not contain an intercept.
+
+    ``OrderedModel`` estimates its own thresholds and therefore rejects an
+    exogenous design that contains either an explicit or an implicit constant.
+    Checking the rank of the feature columns alone is insufficient: a set of
+    dummy/count columns can be full-rank while a linear combination of them is
+    still the all-ones vector. Seed the rank calculation with that vector so
+    such a column is omitted along with ordinary linear dependencies.
+    """
+    if design.empty:
+        return []
+    constant = np.ones((len(design), 1), dtype=float)
+    independent_columns: list[str] = []
+    current_rank = int(np.linalg.matrix_rank(constant))
+    for column in design.columns:
+        candidate = independent_columns + [column]
+        candidate_values = np.column_stack(
+            [constant, design[candidate].to_numpy(dtype=float)]
+        )
+        rank = int(np.linalg.matrix_rank(candidate_values))
+        if rank > current_rank:
+            independent_columns.append(column)
+            current_rank = rank
+    return independent_columns
+
+
 def retrospective_ordinal_analysis(
     frame: pd.DataFrame,
     output_dir: str | Path,
@@ -283,6 +313,8 @@ def retrospective_ordinal_analysis(
     seed: int = 42,
 ) -> pd.DataFrame:
     """Estimate observational strategy associations at the 100% checkpoint."""
+    if bootstrap_samples < 0:
+        raise ValueError("bootstrap_samples must be non-negative.")
     try:
         from statsmodels.miscmodels.ordinal_model import OrderedModel
     except ImportError as error:
@@ -316,6 +348,8 @@ def retrospective_ordinal_analysis(
     }
     rng = np.random.default_rng(seed)
     rows: list[dict[str, Any]] = []
+    fit_failures: list[dict[str, str]] = []
+    fitted_models = 0
     for target in ("final_intensity", "drop_magnitude"):
         endog = complete[target].astype(int)
         for block_name, block_features in feature_blocks.items():
@@ -335,17 +369,9 @@ def retrospective_ordinal_analysis(
             )
             design = design.loc[:, design.nunique() > 1]
             # Remove exact linear dependencies (for example total counts vs.
-            # per-strategy counts) before fitting an unregularised ordinal model.
-            independent_columns: list[str] = []
-            current_rank = 0
-            for column in design.columns:
-                candidate = independent_columns + [column]
-                rank = np.linalg.matrix_rank(
-                    design[candidate].to_numpy(dtype=float)
-                )
-                if rank > current_rank:
-                    independent_columns.append(column)
-                    current_rank = rank
+            # per-strategy counts) and any implicit constant before fitting an
+            # unregularised ordinal model with internally estimated thresholds.
+            independent_columns = _independent_columns_without_constant(design)
             design = design[independent_columns]
             retained_features = [
                 feature for feature in varying_features if feature in design
@@ -358,8 +384,19 @@ def retrospective_ordinal_analysis(
                     design,
                     distr="logit",
                 ).fit(method="bfgs", disp=False)
-            except Exception:
+                if not fitted.mle_retvals.get("converged", False):
+                    raise RuntimeError("BFGS did not converge.")
+            except Exception as error:
+                fit_failures.append(
+                    {
+                        "target": target,
+                        "feature_block": block_name,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
                 continue
+            fitted_models += 1
+            wald_intervals = fitted.conf_int(alpha=0.05)
             bootstrap_coefficients: dict[str, list[float]] = {
                 feature: [] for feature in retained_features
             }
@@ -372,7 +409,14 @@ def retrospective_ordinal_analysis(
                 try:
                     sampled_fit = OrderedModel(
                         sampled_y, sampled_x, distr="logit"
-                    ).fit(method="bfgs", disp=False)
+                    ).fit(
+                        method="bfgs",
+                        start_params=fitted.params.to_numpy(dtype=float),
+                        disp=False,
+                        skip_hessian=True,
+                    )
+                    if not sampled_fit.mle_retvals.get("converged", False):
+                        continue
                     for feature in retained_features:
                         bootstrap_coefficients[feature].append(
                             float(sampled_fit.params[feature])
@@ -387,6 +431,8 @@ def retrospective_ordinal_analysis(
                     else (np.nan, np.nan)
                 )
                 coefficient = float(fitted.params[feature])
+                wald_low = float(wald_intervals.loc[feature, 0])
+                wald_high = float(wald_intervals.loc[feature, 1])
                 rows.append(
                     {
                         "target": target,
@@ -395,6 +441,10 @@ def retrospective_ordinal_analysis(
                         "coefficient": coefficient,
                         "odds_ratio": float(np.exp(coefficient)),
                         "p_value": float(fitted.pvalues[feature]),
+                        "wald_ci_2.5": wald_low,
+                        "wald_ci_97.5": wald_high,
+                        "wald_odds_ratio_2.5": float(np.exp(wald_low)),
+                        "wald_odds_ratio_97.5": float(np.exp(wald_high)),
                         "ci_2.5": float(low),
                         "ci_97.5": float(high),
                         "bootstrap_successes": len(values),
@@ -402,6 +452,15 @@ def retrospective_ordinal_analysis(
                     }
                 )
     result = pd.DataFrame(rows)
+    if result.empty:
+        failure_details = "; ".join(
+            f"{failure['target']}/{failure['feature_block']}: {failure['error']}"
+            for failure in fit_failures
+        )
+        raise RuntimeError(
+            "Retrospective ordinal analysis did not fit any model. "
+            f"Fit failures: {failure_details or 'none recorded'}"
+        )
     if not result.empty:
         result["p_value_fdr"] = benjamini_hochberg(result["p_value"])
     output = Path(output_dir)
@@ -414,9 +473,15 @@ def retrospective_ordinal_analysis(
             {
                 "checkpoint": 1.0,
                 "bootstrap_samples": bootstrap_samples,
+                "primary_interval": "analytic_wald_95",
+                "bootstrap_interval": (
+                    "percentile_95_sensitivity" if bootstrap_samples else "not_run"
+                ),
                 "seed": seed,
                 "causal_interpretation": False,
                 "controls": controls + categorical_controls,
+                "fitted_models": fitted_models,
+                "fit_failures": fit_failures,
             },
             handle,
             indent=2,

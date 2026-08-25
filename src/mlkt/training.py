@@ -47,6 +47,7 @@ from .neural_data import (
     temporal_collate,
 )
 from .outcome_augmentation import validate_outcome_augmentation_frame
+from .outcome_labels import get_outcome_label_scheme, relabel_outcome_frame
 from .strategy import strategy_feature_columns, strategy_vocabulary
 from .validation import validate_augmentation_artifacts, validate_source_training_frame
 
@@ -823,6 +824,7 @@ def _run_temporal_epoch(
     scheduler: Any | None = None,
     progress_description: str | None = None,
     progress_position: int = 0,
+    label_scheme: str = "original4",
 ) -> tuple[dict[str, float], pd.DataFrame]:
     training = optimizer is not None
     model.train(training)
@@ -830,6 +832,8 @@ def _run_temporal_epoch(
     component_losses: dict[str, list[float]] = {"final_loss": [], "drop_loss": []}
     identifiers: list[str] = []
     initial_values: list[int] = []
+    final_raw_values: list[int] = []
+    drop_raw_values: list[int] = []
     final_true: list[int] = []
     final_pred: list[int] = []
     drop_true: list[int] = []
@@ -850,6 +854,8 @@ def _run_temporal_epoch(
         for batch_index, raw_batch in enumerate(iterator, start=1):
             identifiers.extend(raw_batch["conversation_id"])
             initial_values.extend(raw_batch["initial_intensity"].tolist())
+            final_raw_values.extend(raw_batch["final_target_raw"].tolist())
+            drop_raw_values.extend(raw_batch["drop_target_raw"].tolist())
             batch = _move_tensors(raw_batch, device)
             outputs = model(batch)
             loss, loss_parts = temporal_multitask_loss(
@@ -889,10 +895,11 @@ def _run_temporal_epoch(
                 .cpu()
                 .tolist()
             )
-    final_metrics = classification_metrics(final_true, final_pred, labels=(1, 2, 3, 4))
-    final_metrics.update(ordinal_metrics(final_true, final_pred, labels=(1, 2, 3, 4)))
-    drop_metrics = classification_metrics(drop_true, drop_pred, labels=(1, 2, 3, 4))
-    drop_metrics.update(ordinal_metrics(drop_true, drop_pred, labels=(1, 2, 3, 4)))
+    scheme = get_outcome_label_scheme(label_scheme)
+    final_metrics = classification_metrics(final_true, final_pred, labels=scheme.labels)
+    final_metrics.update(ordinal_metrics(final_true, final_pred, labels=scheme.labels))
+    drop_metrics = classification_metrics(drop_true, drop_pred, labels=scheme.labels)
+    drop_metrics.update(ordinal_metrics(drop_true, drop_pred, labels=scheme.labels))
     metrics = {"loss": float(np.mean(losses))}
     metrics.update(
         {name: float(np.mean(values)) for name, values in component_losses.items()}
@@ -903,13 +910,15 @@ def _run_temporal_epoch(
         {
             "conversation_id": identifiers,
             "initial_intensity": initial_values,
+            "final_target_raw": final_raw_values,
+            "drop_target_raw": drop_raw_values,
             "final_target": final_true,
             "final_prediction": final_pred,
             "drop_target": drop_true,
             "drop_prediction": drop_pred,
         }
     )
-    for index in range(4):
+    for index in range(scheme.num_classes):
         predictions[f"final_probability_{index + 1}"] = np.asarray(
             final_probabilities
         )[:, index]
@@ -921,6 +930,7 @@ def _run_temporal_epoch(
         predictions["final_prediction"],
         predictions["drop_target"],
         predictions["drop_prediction"],
+        label_scheme=scheme.name,
     )
     metrics.update(joint_metrics)
     for name, values in joint_arrays.items():
@@ -944,6 +954,8 @@ def train_temporal_model(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     frame = pd.read_csv(checkpoints_path)
+    scheme = get_outcome_label_scheme(config.get("label_scheme"))
+    frame = relabel_outcome_frame(frame, scheme.name)
     subset = frame[np.isclose(frame["checkpoint"].astype(float), checkpoint)].copy()
     if subset.empty:
         raise ValueError(f"No rows found for checkpoint {checkpoint}.")
@@ -1027,6 +1039,7 @@ def train_temporal_model(
         dropout=config["dropout"],
         max_chunks=config["max_chunks"],
         use_initial_intensity=use_initial_intensity,
+        num_outcome_classes=scheme.num_classes,
     ).to(device)
     run_config = {
         "run_type": "temporal",
@@ -1035,6 +1048,7 @@ def train_temporal_model(
         "transfer": transfer_checkpoint is not None,
         "seed": seed,
         "use_initial_intensity": use_initial_intensity,
+        "label_scheme": scheme.to_manifest(),
         "initial_intensity_standardization": (
             {"mean": initial_mean, "std": initial_std, "source": "train_only"}
             if use_initial_intensity
@@ -1059,12 +1073,8 @@ def train_temporal_model(
         },
         "config": config,
     }
-    final_weights = _class_weights(
-        train["final_intensity"], (1, 2, 3, 4), device
-    )
-    drop_weights = _class_weights(
-        train["drop_magnitude"], (1, 2, 3, 4), device
-    )
+    final_weights = _class_weights(train["final_intensity"], scheme.labels, device)
+    drop_weights = _class_weights(train["drop_magnitude"], scheme.labels, device)
     run_config["class_weights"] = {
         "final_intensity": final_weights.detach().cpu().tolist(),
         "drop_magnitude": drop_weights.detach().cpu().tolist(),
@@ -1122,6 +1132,7 @@ def train_temporal_model(
             scheduler,
             progress_description=f"epoch {epoch} train",
             progress_position=progress_position + 1,
+            label_scheme=scheme.name,
         )
         validation_metrics, _ = _run_temporal_epoch(
             model,
@@ -1131,6 +1142,7 @@ def train_temporal_model(
             drop_weights,
             progress_description=f"epoch {epoch} validation",
             progress_position=progress_position + 1,
+            label_scheme=scheme.name,
         )
         score = (
             validation_metrics["final_f1_macro"]
@@ -1178,6 +1190,7 @@ def train_temporal_model(
             drop_weights,
             progress_description=f"{run_label} final {split_name}",
             progress_position=progress_position + 1,
+            label_scheme=scheme.name,
         )
         predictions["split"] = split_name
         predictions["checkpoint"] = checkpoint
@@ -1185,6 +1198,7 @@ def train_temporal_model(
         predictions["modality"] = modality
         predictions["transfer"] = transfer_checkpoint is not None
         predictions["use_initial_intensity"] = use_initial_intensity
+        predictions["label_scheme"] = scheme.name
         predictions["seed"] = seed
         predictions.to_csv(output / f"{split_name}_predictions.csv", index=False)
         diagnostic_rows: list[dict[str, Any]] = []
@@ -1196,13 +1210,16 @@ def train_temporal_model(
             diagnostic_rows.extend(
                 {"target": target, **row}
                 for row in per_class_metrics(
-                    truth, predicted, labels=(1, 2, 3, 4), label_names=("1", "2", "3", "4")
+                    truth,
+                    predicted,
+                    labels=scheme.labels,
+                    label_names=scheme.label_names,
                 )
             )
             confusion_rows.extend(
                 {"target": target, **row}
                 for row in confusion_matrix_records(
-                    truth, predicted, labels=(1, 2, 3, 4)
+                    truth, predicted, labels=scheme.labels
                 )
             )
         pd.DataFrame(diagnostic_rows).to_csv(
@@ -1224,6 +1241,7 @@ def train_temporal_model(
                     "modality": modality,
                     "transfer": transfer_checkpoint is not None,
                     "use_initial_intensity": use_initial_intensity,
+                    "label_scheme": scheme.name,
                     "seed": seed,
                     **{
                         key.removeprefix(f"{prefix}_"): value
@@ -1248,6 +1266,7 @@ def train_temporal_model(
         "transfer": transfer_checkpoint is not None,
         "seed": seed,
         "use_initial_intensity": use_initial_intensity,
+        "label_scheme": scheme.to_manifest(),
         "initial_intensity_standardization": (
             {"mean": initial_mean, "std": initial_std, "source": "train_only"}
             if use_initial_intensity

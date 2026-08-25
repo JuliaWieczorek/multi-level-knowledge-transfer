@@ -57,12 +57,14 @@ def experiment_variants() -> tuple[dict[str, Any], ...]:
 def matrix_manifest(
     checkpoints: Sequence[float],
     seeds: Sequence[int],
+    label_scheme: str = "original4",
 ) -> list[dict[str, Any]]:
     return [
         {
             "checkpoint": float(checkpoint),
             "checkpoint_percent": int(round(float(checkpoint) * 100)),
             "seed": int(seed),
+            "label_scheme": label_scheme,
             **variant,
         }
         for seed in seeds
@@ -87,8 +89,21 @@ def run_experiment_matrix(
     source_root = Path(source_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    runs = matrix_manifest(checkpoints, seeds)
-    with (output_root / "matrix_manifest.json").open(
+    label_scheme = str(config.get("label_scheme", "original4"))
+    runs = matrix_manifest(checkpoints, seeds, label_scheme=label_scheme)
+    matrix_manifest_path = output_root / "matrix_manifest.json"
+    if matrix_manifest_path.exists():
+        with matrix_manifest_path.open(encoding="utf-8") as handle:
+            existing_runs = json.load(handle)
+        existing_schemes = {
+            str(run.get("label_scheme", "original4")) for run in existing_runs
+        }
+        if existing_schemes != {label_scheme}:
+            raise ValueError(
+                f"Output root {output_root} already contains label scheme(s) "
+                f"{sorted(existing_schemes)}; refusing to mix with {label_scheme!r}."
+            )
+    with matrix_manifest_path.open(
         "w", encoding="utf-8"
     ) as handle:
         json.dump(runs, handle, indent=2)

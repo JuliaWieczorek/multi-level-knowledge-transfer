@@ -13,3 +13,5 @@ data/MEISD_DA_ready.csv
 *.safetensors
 outputs/**
 !outputs/.gitkeep
+outputs_first_version/
+src/*.egg-info/

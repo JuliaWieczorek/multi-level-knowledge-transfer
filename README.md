@@ -267,6 +267,38 @@ python -m mlkt.cli baseline --dataset esconv --task drop_magnitude --model initi
 python -m unittest discover -s tests -v
 ```
 
+## Secondary three-class outcome analysis
+
+The optional `coarse3` scheme maps the original five-point values for both
+outcomes as `1-2 -> 1`, `3 -> 2`, and `4-5 -> 3`. For final intensity these
+classes mean low, middle, and high intensity; for drop magnitude they mean
+small, middle, and large decrease. Raw targets remain in every predictions
+file, and joint consistency is evaluated as feasibility on the original scale.
+The default `original4` experiment is unchanged.
+
+First run a full-context pilot (30 runs), then resume with the complete matrix
+only if the validation and test diagnostics justify the cost:
+
+```powershell
+python -m mlkt.cli run-matrix --label-scheme coarse3 --checkpoints 100 `
+  --output-dir outputs\temporal_coarse3
+
+python -m mlkt.cli report --experiments outputs\temporal_coarse3 `
+  --output-dir outputs\report_coarse3_tci
+
+# Resume to all 150 runs; completed 100% runs are skipped.
+python -m mlkt.cli run-matrix --label-scheme coarse3 `
+  --output-dir outputs\temporal_coarse3
+
+python -m mlkt.cli compare-label-schemes `
+  --original-report outputs\report_tci `
+  --coarse-report outputs\report_coarse3_tci `
+  --output-dir outputs\label_scheme_comparison
+```
+
+This is a new target-training experiment. Source MTL checkpoints are reused,
+but all selected temporal target models must be trained again.
+
 ## Reproducibility and data policy
 
 - Conversation splits are assigned before checkpoint expansion.

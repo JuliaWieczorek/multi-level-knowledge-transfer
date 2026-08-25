@@ -333,12 +333,16 @@ class TemporalMultiModalModel(nn.Module):
         dropout: float = 0.4,
         max_chunks: int = 32,
         use_initial_intensity: bool = False,
+        num_outcome_classes: int = 4,
     ) -> None:
         super().__init__()
         if modality not in self.MODALITIES:
             raise ValueError(f"Unsupported modality: {modality}")
         self.modality = modality
         self.use_initial_intensity = use_initial_intensity
+        if num_outcome_classes < 2:
+            raise ValueError("Temporal outcomes require at least two classes.")
+        self.num_outcome_classes = num_outcome_classes
         if use_initial_intensity and modality != "text_strategy":
             raise ValueError("Initial intensity is supported only for text_strategy.")
         self.text_encoder: AffectiveTextEncoder | None = None
@@ -375,8 +379,8 @@ class TemporalMultiModalModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
         )
-        self.final_head = nn.Linear(output_size // 2, 4)
-        self.drop_head = nn.Linear(output_size // 2, 4)
+        self.final_head = nn.Linear(output_size // 2, num_outcome_classes)
+        self.drop_head = nn.Linear(output_size // 2, num_outcome_classes)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         text: torch.Tensor | None = None

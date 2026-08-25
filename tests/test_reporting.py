@@ -1,9 +1,16 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
 
-from mlkt.reporting import aggregate_seed_metrics, paired_transfer_deltas
+from mlkt.reporting import (
+    _ci95,
+    aggregate_seed_metrics,
+    compare_label_scheme_reports,
+    paired_transfer_deltas,
+)
 from mlkt.metrics import (
     classification_metrics,
     joint_prediction_diagnostics,
@@ -12,6 +19,11 @@ from mlkt.metrics import (
 
 
 class ReportingTests(unittest.TestCase):
+    def test_ci95_uses_student_t_for_five_seeds(self):
+        interval = _ci95(pd.Series([1.0, 2.0, 3.0, 4.0, 5.0]))
+        expected = 2.7764 * np.std([1.0, 2.0, 3.0, 4.0, 5.0], ddof=1) / np.sqrt(5)
+        self.assertAlmostEqual(interval, expected)
+
     def test_classification_macro_f1_uses_fixed_label_space(self):
         metrics = classification_metrics([1, 1], [1, 1], labels=(1, 2, 3, 4))
         self.assertEqual(metrics["accuracy"], 1.0)
@@ -66,6 +78,43 @@ class ReportingTests(unittest.TestCase):
                 deltas["f1_macro_delta_transfer_minus_vanilla"], 0.10
             )
         )
+
+    def test_label_scheme_comparison_is_explicitly_descriptive(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = []
+            for scheme, score in (("original4", 0.30), ("coarse3", 0.45)):
+                report = root / scheme
+                report.mkdir()
+                frame = pd.DataFrame(
+                    [
+                        {
+                            "checkpoint": 1.0,
+                            "checkpoint_percent": 100,
+                            "split": "test",
+                            "target": "final_intensity",
+                            "modality": "text",
+                            "transfer": False,
+                            "use_initial_intensity": False,
+                            "label_scheme": scheme,
+                            "f1_macro_mean": score,
+                            "accuracy_mean": score,
+                            "mae_mean": 1.0,
+                        }
+                    ]
+                )
+                frame.to_csv(report / "metrics_by_checkpoint.csv", index=False)
+                rows.append(report)
+            output = root / "comparison"
+            manifest = compare_label_scheme_reports(rows[0], rows[1], output)
+            comparison = pd.read_csv(output / "label_scheme_comparison.csv")
+            self.assertAlmostEqual(
+                comparison[
+                    "f1_macro_descriptive_delta_coarse3_minus_original4"
+                ].iloc[0],
+                0.15,
+            )
+            self.assertIn("descriptive only", manifest["warning"])
 
 
 if __name__ == "__main__":

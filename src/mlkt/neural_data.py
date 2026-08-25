@@ -325,6 +325,12 @@ class TemporalDataset(Dataset):
             "final_target": int(row["final_intensity"]) - 1,
             "drop_target": int(row["drop_magnitude"]) - 1,
             "initial_intensity": int(row["initial_intensity"]),
+            "final_target_raw": int(
+                row.get("final_intensity_raw", row["final_intensity"])
+            ),
+            "drop_target_raw": int(
+                row.get("drop_magnitude_raw", row["drop_magnitude"])
+            ),
         }
         if self.use_initial_intensity:
             item["initial_feature"] = (
@@ -537,6 +543,14 @@ def temporal_collate(
         ),
         "initial_intensity": torch.tensor(
             [item["initial_intensity"] for item in items], dtype=torch.long
+        ),
+        "final_target_raw": torch.tensor(
+            [item.get("final_target_raw", item["final_target"] + 1) for item in items],
+            dtype=torch.long,
+        ),
+        "drop_target_raw": torch.tensor(
+            [item.get("drop_target_raw", item["drop_target"] + 1) for item in items],
+            dtype=torch.long,
         ),
     }
     if "initial_feature" in items[0]:
