@@ -1028,6 +1028,7 @@ def train_temporal_model(
         "use_initial_intensity": use_initial_intensity,
         "initial_intensity_mean": initial_mean if use_initial_intensity else None,
         "initial_intensity_std": initial_std if use_initial_intensity else None,
+        "cache_tokenization": config.get("cache_tokenization", True),
     }
     train_dataset = TemporalDataset(train, **dataset_arguments)
     validation_dataset = TemporalDataset(validation, **dataset_arguments)
@@ -1076,6 +1077,9 @@ def train_temporal_model(
         num_outcome_classes=scheme.num_classes,
         local_files_only=local_files_only,
     ).to(device)
+    model.set_text_encoder_trainable_layers(
+        config.get("max_trainable_text_encoder_layers")
+    )
     run_config = {
         "run_type": "temporal",
         "checkpoint": checkpoint,
@@ -1219,7 +1223,9 @@ def train_temporal_model(
         torch.load(model_path, map_location=device, weights_only=True)
     )
     metric_rows: list[dict[str, Any]] = []
-    for split_name in ("validation", "test"):
+    evaluate_test = bool(config.get("evaluate_test", True))
+    evaluation_splits = ("validation", "test") if evaluate_test else ("validation",)
+    for split_name in evaluation_splits:
         metrics, predictions = _run_temporal_epoch(
             model,
             loaders[split_name],
@@ -1322,6 +1328,7 @@ def train_temporal_model(
         "source_checkpoint_sha256": source_checkpoint_hash,
         "device": str(device),
         "precision": precision,
+        "test_evaluated": evaluate_test,
         "duration_seconds": time.time() - started_at,
         "best_model_retained": bool(config.get("retain_best_model", False)),
     }
@@ -1502,6 +1509,7 @@ def _run_outcome_ceiling_epoch(
     direct_classification_weight: float = 1.0,
     ordinal_auxiliary_weight: float = 0.2,
     consistency_weight: float = 0.1,
+    precision: str = "fp32",
 ) -> tuple[dict[str, float], pd.DataFrame]:
     training = optimizer is not None
     model.train(training)
@@ -1523,7 +1531,7 @@ def _run_outcome_ceiling_epoch(
     drop_probabilities: list[list[float]] = []
     joint_probabilities: list[list[float]] = []
     context = torch.enable_grad() if training else torch.no_grad()
-    with context:
+    with context, _autocast_context(device, precision):
         iterator = tqdm(
             loader,
             desc=progress_description,
@@ -1824,7 +1832,16 @@ def _outcome_trainable_layers(
     if any(value <= 0 for value in stages):
         raise ValueError("gradual_unfreeze_layers must contain positive values.")
     stage_index = epoch - freeze_epochs - 1
-    return stages[stage_index] if stage_index < len(stages) else None
+    configured_layers = stages[stage_index] if stage_index < len(stages) else None
+    maximum_layers = config.get("max_trainable_text_encoder_layers")
+    if maximum_layers is None:
+        return configured_layers
+    maximum_layers = int(maximum_layers)
+    if maximum_layers <= 0:
+        raise ValueError("max_trainable_text_encoder_layers must be positive.")
+    if configured_layers is None:
+        return maximum_layers
+    return min(configured_layers, maximum_layers)
 
 
 def train_outcome_ceiling_model(
@@ -1861,6 +1878,7 @@ def train_outcome_ceiling_model(
     emotion_vocabulary = categorical_vocabulary(train["emotion_family"].tolist())
     problem_vocabulary = categorical_vocabulary(train["problem_type"].tolist())
     device = resolve_device(config.get("device", "auto"))
+    precision = resolve_precision(config.get("precision", "fp32"), device)
     tokenizer = AutoTokenizer.from_pretrained(config["transformer_name"])
     dataset_arguments = {
         "tokenizer": tokenizer,
@@ -1869,6 +1887,7 @@ def train_outcome_ceiling_model(
         "strategy_mode": config.get("strategy_mode", "quantity_timing_order"),
         "max_length": config["max_length"],
         "max_chunks": config["max_chunks"],
+        "cache_tokenization": config.get("cache_tokenization", True),
     }
     datasets = {
         "train": OutcomeCeilingDataset(train, **dataset_arguments),
@@ -2039,6 +2058,7 @@ def train_outcome_ceiling_model(
             else None
         ),
         "architecture": config.get("architecture", "base"),
+        "precision": precision,
         "outcome_augmentation": outcome_augmentation_report,
         "environment": {
             "python": sys.version,
@@ -2092,6 +2112,7 @@ def train_outcome_ceiling_model(
             auxiliary_regression_weight,
             optimizer,
             scheduler,
+            precision=precision,
             progress_description=f"outcome epoch {epoch} train",
             progress_position=progress_position + 1,
             **epoch_loss_kwargs,
@@ -2102,6 +2123,7 @@ def train_outcome_ceiling_model(
             device,
             threshold_weights,
             auxiliary_regression_weight,
+            precision=precision,
             progress_description=f"outcome epoch {epoch} validation",
             progress_position=progress_position + 1,
             **epoch_loss_kwargs,
@@ -2148,6 +2170,7 @@ def train_outcome_ceiling_model(
             device,
             threshold_weights,
             auxiliary_regression_weight,
+            precision=precision,
             progress_description=f"outcome final {split_name}",
             progress_position=progress_position + 1,
             **epoch_loss_kwargs,
@@ -2225,6 +2248,7 @@ def train_outcome_ceiling_model(
         "source_checkpoint": run_config["source_checkpoint"],
         "source_checkpoint_sha256": source_checkpoint_hash,
         "device": str(device),
+        "precision": precision,
         "environment": run_config["environment"],
         "test_evaluated": "test" in evaluation_splits,
         "duration_seconds": time.time() - started_at,

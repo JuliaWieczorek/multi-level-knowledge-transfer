@@ -354,6 +354,21 @@ def augment_outcomes(args: argparse.Namespace) -> None:
     print(json.dumps(manifest, indent=2))
 
 
+def prepare_augmented_checkpoints(args: argparse.Namespace) -> None:
+    from .outcome_augmentation import build_augmented_temporal_checkpoints
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    frame = pd.read_csv(input_path)
+    checkpoints, report = build_augmented_temporal_checkpoints(frame)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoints.to_csv(output_path, index=False)
+    report_path = output_path.with_suffix(".manifest.json")
+    with report_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+    print(json.dumps({**report, "output_path": str(output_path)}, indent=2))
+
+
 def pretrain_transfer(args: argparse.Namespace) -> None:
     from tqdm.auto import tqdm
 
@@ -447,6 +462,8 @@ def train_temporal(args: argparse.Namespace) -> None:
     temporal = dict(config["temporal"])
     if args.label_scheme is not None:
         temporal["label_scheme"] = args.label_scheme
+    if args.validation_only:
+        temporal["evaluate_test"] = False
     if args.modality == "strategy" and args.transfer:
         raise ValueError(
             "Strategy-only has no text encoder and therefore no transfer variant."
@@ -605,7 +622,8 @@ def run_matrix(args: argparse.Namespace) -> None:
     else:
         output_root = configured_output
     result = run_experiment_matrix(
-        checkpoints_path=_resolve_config_path(
+        checkpoints_path=args.input
+        or _resolve_config_path(
             config["transfer"]["esconv_checkpoints_path"], config_path
         ),
         source_root=_config_output_path(
@@ -1007,6 +1025,7 @@ def build_parser() -> argparse.ArgumentParser:
     temporal_parser.add_argument(
         "--label-scheme", choices=("original4", "coarse3")
     )
+    temporal_parser.add_argument("--validation-only", action="store_true")
     temporal_parser.set_defaults(function=train_temporal)
 
     outcome_parser = subparsers.add_parser("train-outcome-ceiling")
@@ -1052,6 +1071,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     matrix_parser = subparsers.add_parser("run-matrix")
     matrix_parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    matrix_parser.add_argument("--input")
     matrix_parser.add_argument("--output-dir")
     matrix_parser.add_argument("--dry-run", action="store_true")
     matrix_parser.add_argument("--overwrite", action="store_true")
@@ -1072,6 +1092,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional seed subset for a pilot run.",
     )
     matrix_parser.set_defaults(function=run_matrix)
+
+    augmented_checkpoints_parser = subparsers.add_parser(
+        "prepare-augmented-checkpoints"
+    )
+    augmented_checkpoints_parser.add_argument(
+        "--input",
+        default=str(
+            PROJECT_ROOT
+            / "data"
+            / "processed"
+            / "outcome_augmentation"
+            / "full_50pct"
+            / "esconv_outcome_augmented.csv"
+        ),
+    )
+    augmented_checkpoints_parser.add_argument(
+        "--output",
+        default=str(
+            PROJECT_ROOT / "data" / "processed" / "esconv_checkpoints_augmented.csv"
+        ),
+    )
+    augmented_checkpoints_parser.set_defaults(function=prepare_augmented_checkpoints)
 
     strategy_parser = subparsers.add_parser("analyze-strategies")
     strategy_parser.add_argument("--config", default=str(DEFAULT_CONFIG))

@@ -123,10 +123,13 @@ The default experiment configuration uses the already-cached BERT files with
 can run without network access. Set this option to `false` only when a configured
 transformer still needs to be downloaded.
 
-Source and temporal neural training use BF16 automatic mixed precision by
-default. Model parameters and saved checkpoints remain FP32, while supported GPU
-operations run in BF16. The selected precision is recorded in every run
+Source, temporal, and outcome neural training use BF16 automatic mixed precision
+by default. Model parameters and saved checkpoints remain FP32, while supported
+GPU operations run in BF16. The selected precision is recorded in every run
 configuration and summary; set `precision` to `fp32` to disable autocasting.
+Temporal and outcome training cache tokenized conversations in memory, use
+batches of eight, and limit fine-tuning to the top four layers of each BERT
+encoder.
 
 Qwen2.5 GGUF augmentation additionally requires:
 
@@ -185,6 +188,14 @@ python -m mlkt.cli run-matrix --dry-run
 
 # 6. Run/resume all target experiments on CUDA.
 python -m mlkt.cli run-matrix
+
+# Optional augmentation experiment: expand each valid synthetic ESConv training
+# conversation over the same 10/25/50/75/100% boundaries as its source, then
+# keep its 150 runs isolated from the original-data control matrix.
+python -m mlkt.cli prepare-augmented-checkpoints
+python -m mlkt.cli run-matrix `
+  --input data\processed\esconv_checkpoints_augmented.csv `
+  --output-dir outputs\temporal_augmented
 
 # 7. Quantity/timing/order and retrospective association analyses.
 python -m mlkt.cli analyze-strategies

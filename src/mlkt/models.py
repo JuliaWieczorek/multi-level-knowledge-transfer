@@ -395,6 +395,11 @@ class TemporalMultiModalModel(nn.Module):
         self.final_head = nn.Linear(output_size // 2, num_outcome_classes)
         self.drop_head = nn.Linear(output_size // 2, num_outcome_classes)
 
+    def set_text_encoder_trainable_layers(self, top_layers: int | None) -> None:
+        """Freeze lower BERT layers while leaving temporal fusion heads trainable."""
+        if self.text_encoder is not None:
+            self.text_encoder.set_trainable_layers(top_layers)
+
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         text: torch.Tensor | None = None
         strategy: torch.Tensor | None = None

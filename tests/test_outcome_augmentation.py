@@ -7,6 +7,7 @@ import pandas as pd
 
 from mlkt.outcome_augmentation import (
     DeterministicOutcomeMockGenerator,
+    build_augmented_temporal_checkpoints,
     build_outcome_augmentation_plan,
     outcome_rewrite_prompt,
     run_outcome_augmentation,
@@ -44,6 +45,66 @@ def _row(
 
 
 class OutcomeAugmentationTests(unittest.TestCase):
+    def test_augmented_temporal_checkpoints_follow_source_boundaries(self):
+        half = _row("source", "train", 2, 2)
+        half.update(
+            {
+                "checkpoint": 0.5,
+                "augmented": False,
+            }
+        )
+        full = _row("source", "train", 2, 2)
+        full.update(
+            {
+                "text": "I feel stuck. Tell me more. It is still difficult.",
+                "text_role_turns": json.dumps(
+                    [
+                        "seeker: I feel stuck.",
+                        "supporter: Tell me more.",
+                        "seeker: It is still difficult.",
+                    ]
+                ),
+                "text_seeker": "I feel stuck. It is still difficult.",
+                "text_seeker_turns": json.dumps(
+                    ["I feel stuck.", "It is still difficult."]
+                ),
+                "augmented": False,
+            }
+        )
+        synthetic = {
+            **full,
+            "conversation_id": "source__outcome_aug_0000",
+            "source_conversation_id": "source",
+            "text_seeker": "I remain trapped. This continues to be difficult.",
+            "text_seeker_turns": json.dumps(
+                ["I remain trapped.", "This continues to be difficult."]
+            ),
+            "augmented": True,
+            "generation_valid": True,
+            "generation_seed": 42,
+            "generator": "llama-test",
+            "changed_seeker_turn_share": 1.0,
+            "source_text_similarity": 0.1,
+            "min_changed_turn_share_required": 0.6,
+            "max_source_text_similarity_allowed": 0.92,
+        }
+        checkpoints, report = build_augmented_temporal_checkpoints(
+            pd.DataFrame([half, full, synthetic])
+        )
+        generated = checkpoints[
+            checkpoints["augmented"].astype(str).str.lower().eq("true")
+        ].sort_values("checkpoint")
+        self.assertEqual(len(generated), 2)
+        self.assertEqual(
+            json.loads(generated.iloc[0]["text_seeker_turns"]),
+            ["I remain trapped."],
+        )
+        self.assertEqual(
+            json.loads(generated.iloc[1]["text_seeker_turns"]),
+            ["I remain trapped.", "This continues to be difficult."],
+        )
+        self.assertEqual(report["synthetic_checkpoint_rows"], 2)
+
     def test_novelty_gate_rejects_near_and_exact_duplicates(self):
         source = pd.Series(_row("source", "train", 4, 1))
         near_duplicate = {

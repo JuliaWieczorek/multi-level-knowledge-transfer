@@ -4,6 +4,25 @@ from mlkt.cli import build_parser
 
 
 class CliTests(unittest.TestCase):
+    def test_temporal_accepts_validation_only(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "train-temporal",
+                "--output-dir",
+                "unused",
+                "--checkpoint",
+                "100",
+                "--modality",
+                "text",
+                "--transfer",
+                "--label-scheme",
+                "coarse3",
+                "--validation-only",
+            ]
+        )
+        self.assertTrue(args.validation_only)
+
     def test_strategy_bootstrap_zero_is_preserved_by_parser(self):
         args = build_parser().parse_args(
             ["analyze-strategies", "--retrospective-only", "--bootstrap-samples", "0"]

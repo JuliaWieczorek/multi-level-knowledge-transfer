@@ -1,0 +1,19 @@
+{
+  "augmented_rows": 359,
+  "source_conversations": 359,
+  "generators": [
+    "llama-cpp:Qwen2.5 7B Instruct"
+  ],
+  "validated": true,
+  "checkpoint_values": [
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "original_rows": 5750,
+  "synthetic_conversations": 359,
+  "synthetic_checkpoint_rows": 1795,
+  "output_rows": 7545
+}

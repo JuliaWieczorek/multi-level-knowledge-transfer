@@ -5,6 +5,8 @@ import pandas as pd
 
 from mlkt.strategy import (
     _independent_columns_without_constant,
+    _drop_linearly_dependent_columns,
+    _fit_bootstrap_ordered_model,
     benjamini_hochberg,
     encode_strategy_sequence,
     ensure_strategy_columns,
@@ -71,6 +73,46 @@ class StrategyFeatureTests(unittest.TestCase):
             retrospective_ordinal_analysis(
                 pd.DataFrame(), "unused", bootstrap_samples=-1
             )
+
+    def test_ordinal_design_drops_columns_that_span_a_constant(self):
+        design = pd.DataFrame(
+            {
+                "category_a": [1.0, 1.0, 0.0, 0.0],
+                "category_b": [0.0, 0.0, 1.0, 1.0],
+                "varying_control": [0.0, 1.0, 2.0, 3.0],
+            }
+        )
+
+        reduced = _drop_linearly_dependent_columns(
+            design, account_for_constant=True
+        )
+
+        augmented = np.column_stack(
+            [np.ones(len(reduced)), reduced.to_numpy(dtype=float)]
+        )
+        self.assertEqual(np.linalg.matrix_rank(augmented), augmented.shape[1])
+        self.assertEqual(
+            set(reduced.columns), {"category_a", "varying_control"}
+        )
+
+    def test_bootstrap_fit_skips_unused_hessian(self):
+        class RecordingModel:
+            def __init__(self):
+                self.options = None
+
+            def fit(self, **options):
+                self.options = options
+                return "fitted"
+
+        model = RecordingModel()
+
+        result = _fit_bootstrap_ordered_model(model)
+
+        self.assertEqual(result, "fitted")
+        self.assertEqual(
+            model.options,
+            {"method": "bfgs", "disp": False, "skip_hessian": True},
+        )
 
 
 if __name__ == "__main__":

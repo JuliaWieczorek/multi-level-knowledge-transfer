@@ -294,6 +294,7 @@ class TemporalDataset(Dataset):
         use_initial_intensity: bool = False,
         initial_intensity_mean: float | None = None,
         initial_intensity_std: float | None = None,
+        cache_tokenization: bool = True,
     ) -> None:
         self.frame = ensure_strategy_columns(frame).reset_index(drop=True)
         self.tokenizer = tokenizer
@@ -314,6 +315,17 @@ class TemporalDataset(Dataset):
             or initial_intensity_std <= 0
         ):
             raise ValueError("Initial-aware datasets require train-derived mean and std.")
+        self._tokenized_chunks: list[list[dict[str, torch.Tensor]]] | None = None
+        if "text" in modality and cache_tokenization:
+            self._tokenized_chunks = [
+                tokenize_turn_chunks(
+                    self.tokenizer,
+                    json.loads(raw_turns),
+                    max_length=self.max_length,
+                    max_chunks=self.max_chunks,
+                )
+                for raw_turns in self.frame["text_seeker_turns"]
+            ]
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -337,12 +349,15 @@ class TemporalDataset(Dataset):
                 float(row["initial_intensity"]) - float(self.initial_intensity_mean)
             ) / float(self.initial_intensity_std)
         if "text" in self.modality:
-            turns = json.loads(row["text_seeker_turns"])
-            item["chunks"] = tokenize_turn_chunks(
-                self.tokenizer,
-                turns,
-                max_length=self.max_length,
-                max_chunks=self.max_chunks,
+            item["chunks"] = (
+                self._tokenized_chunks[index]
+                if self._tokenized_chunks is not None
+                else tokenize_turn_chunks(
+                    self.tokenizer,
+                    json.loads(row["text_seeker_turns"]),
+                    max_length=self.max_length,
+                    max_chunks=self.max_chunks,
+                )
             )
         if "strategy" in self.modality:
             sequence = parse_strategy_sequence(row["strategy_sequence"])
@@ -378,6 +393,7 @@ class OutcomeCeilingDataset(Dataset):
         strategy_mode: str = "quantity_timing_order",
         max_length: int = 128,
         max_chunks: int = 32,
+        cache_tokenization: bool = True,
     ) -> None:
         required = {
             "conversation_id",
@@ -402,6 +418,17 @@ class OutcomeCeilingDataset(Dataset):
         self.strategy_columns = strategy_feature_columns(strategy_mode)
         self.max_length = max_length
         self.max_chunks = max_chunks
+        self._tokenized_chunks: list[list[dict[str, torch.Tensor]]] | None = None
+        if cache_tokenization:
+            self._tokenized_chunks = [
+                tokenize_role_aware_chunks(
+                    self.tokenizer,
+                    [str(turn) for turn in json.loads(raw_turns)],
+                    max_length=self.max_length,
+                    max_chunks=self.max_chunks,
+                )
+                for raw_turns in self.frame["text_role_turns"]
+            ]
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -412,9 +439,16 @@ class OutcomeCeilingDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.frame.iloc[index]
-        turns = json.loads(row["text_role_turns"])
-        if not isinstance(turns, list) or not turns:
-            raise ValueError("text_role_turns must contain a non-empty JSON list.")
+        chunks = (
+            self._tokenized_chunks[index]
+            if self._tokenized_chunks is not None
+            else tokenize_role_aware_chunks(
+                self.tokenizer,
+                [str(turn) for turn in json.loads(row["text_role_turns"])],
+                max_length=self.max_length,
+                max_chunks=self.max_chunks,
+            )
+        )
         strategy_sequence = parse_strategy_sequence(row["strategy_sequence"])
         strategy_positions = parse_strategy_positions(
             row.get("strategy_positions_normalized", ""),
@@ -425,12 +459,7 @@ class OutcomeCeilingDataset(Dataset):
         )
         return {
             "conversation_id": str(row["conversation_id"]),
-            "chunks": tokenize_role_aware_chunks(
-                self.tokenizer,
-                [str(turn) for turn in turns],
-                max_length=self.max_length,
-                max_chunks=self.max_chunks,
-            ),
+            "chunks": chunks,
             "initial_intensity": int(row["initial_intensity"]),
             "emotion_id": self._category_id(
                 row["emotion_family"], self.emotion_vocabulary

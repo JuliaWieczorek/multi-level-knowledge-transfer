@@ -409,6 +409,13 @@ class NeuralContractTests(unittest.TestCase):
         self.assertEqual(_outcome_trainable_layers(3, config), 4)
         self.assertIsNone(_outcome_trainable_layers(4, config))
 
+        capped_config = {
+            **config,
+            "max_trainable_text_encoder_layers": 4,
+        }
+        self.assertEqual(_outcome_trainable_layers(3, capped_config), 4)
+        self.assertEqual(_outcome_trainable_layers(4, capped_config), 4)
+
     def test_joint_outcome_sampler_upweights_rare_pairs(self):
         import pandas as pd
 

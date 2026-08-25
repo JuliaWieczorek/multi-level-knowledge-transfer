@@ -632,6 +632,105 @@ def validate_outcome_augmentation_frame(frame: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def build_augmented_temporal_checkpoints(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Expand valid full-context augmentations over their source checkpoints.
+
+    Checkpoint boundaries and all non-text features come from the immutable
+    source conversation. Only seeker turns visible at a checkpoint are replaced
+    with their aligned generated versions.
+    """
+    validation = validate_outcome_augmentation_frame(frame)
+    augmented = _boolean_series(frame, "augmented", False)
+    originals = frame.loc[~augmented].copy()
+    generated = frame.loc[augmented].copy()
+    checkpoint_values = sorted(originals["checkpoint"].astype(float).unique())
+    metadata_columns = (
+        "source_conversation_id",
+        "augmented",
+        "generation_valid",
+        "generation_seed",
+        "generator",
+        "changed_seeker_turn_share",
+        "source_text_similarity",
+        "min_changed_turn_share_required",
+        "max_source_text_similarity_allowed",
+    )
+    expanded_rows: list[dict[str, Any]] = []
+    for _, synthetic in generated.iterrows():
+        source_id = str(synthetic["source_conversation_id"])
+        source_rows = originals.loc[
+            originals["conversation_id"].astype(str) == source_id
+        ].sort_values("checkpoint")
+        found = sorted(source_rows["checkpoint"].astype(float).unique())
+        if found != checkpoint_values:
+            raise ValueError(
+                f"Source {source_id} has checkpoints {found}, expected {checkpoint_values}."
+            )
+        rewritten_seekers = [
+            _normalise_space(value)
+            for value in json.loads(synthetic["text_seeker_turns"])
+        ]
+        for _, source in source_rows.iterrows():
+            role_turns = json.loads(source["text_role_turns"])
+            visible_seekers = sum(
+                str(turn).partition(": ")[0].strip().lower() == "seeker"
+                for turn in role_turns
+            )
+            if visible_seekers > len(rewritten_seekers):
+                raise ValueError(
+                    f"Synthetic conversation {synthetic['conversation_id']} has too few "
+                    "seeker turns for its source checkpoints."
+                )
+            seeker_index = 0
+            rebuilt_turns: list[str] = []
+            all_contents: list[str] = []
+            visible_rewrites: list[str] = []
+            for raw_turn in role_turns:
+                role, separator, content = str(raw_turn).partition(": ")
+                role = role.strip().lower() if separator else "unknown"
+                if role == "seeker":
+                    content = rewritten_seekers[seeker_index]
+                    visible_rewrites.append(content)
+                    seeker_index += 1
+                content = _normalise_space(content)
+                rebuilt_turns.append(f"{role}: {content}")
+                all_contents.append(content)
+            row = source.to_dict()
+            row.update(
+                {
+                    "conversation_id": str(synthetic["conversation_id"]),
+                    "text": " ".join(all_contents),
+                    "text_role_turns": json.dumps(rebuilt_turns, ensure_ascii=False),
+                    "text_seeker": " ".join(visible_rewrites),
+                    "text_seeker_turns": json.dumps(
+                        visible_rewrites, ensure_ascii=False
+                    ),
+                }
+            )
+            for column in metadata_columns:
+                if column in synthetic.index:
+                    row[column] = synthetic[column]
+            expanded_rows.append(row)
+    expanded = pd.DataFrame(expanded_rows, columns=frame.columns)
+    output = pd.concat([originals, expanded], ignore_index=True, sort=False)
+    if output.duplicated(["conversation_id", "checkpoint"]).any():
+        raise ValueError("Augmented temporal checkpoints contain duplicate keys.")
+    output_augmented = _boolean_series(output, "augmented", False)
+    if output.loc[output_augmented, "split"].ne("train").any():
+        raise ValueError("Augmented temporal checkpoints may contain training rows only.")
+    report = {
+        **validation,
+        "checkpoint_values": checkpoint_values,
+        "original_rows": len(originals),
+        "synthetic_conversations": len(generated),
+        "synthetic_checkpoint_rows": len(expanded),
+        "output_rows": len(output),
+    }
+    return output, report
+
+
 def _plan_signature(plan: Sequence[dict[str, Any]], report: dict[str, Any]) -> str:
     encoded = json.dumps(
         {"plan": list(plan), "settings": report},
@@ -809,6 +908,7 @@ def run_outcome_augmentation(
                     known_texts.add(_text_duplicate_key(generated_row["text_seeker"]))
                     break
                 except (ValueError, json.JSONDecodeError) as generation_error:
+                    generated_row = None
                     attempt_errors.append(str(generation_error))
             if generated_row is None:
                 invalid += 1

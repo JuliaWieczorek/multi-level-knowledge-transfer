@@ -306,6 +306,47 @@ def _independent_columns_without_constant(design: pd.DataFrame) -> list[str]:
     return independent_columns
 
 
+def _drop_linearly_dependent_columns(
+    design: pd.DataFrame,
+    *,
+    account_for_constant: bool = False,
+) -> pd.DataFrame:
+    """Keep a full-rank subset of columns, optionally relative to a constant.
+
+    OrderedModel estimates its thresholds in place of an explicit intercept and
+    therefore rejects a design matrix that contains either an explicit or an
+    implicit constant.  Dummy and strategy columns can jointly span a constant
+    even when every individual column varies, so the rank check must include a
+    column of ones while selecting predictors.
+    """
+    independent_columns: list[str] = []
+    constant = np.ones((len(design), 1), dtype=float)
+    current_rank = 1 if account_for_constant else 0
+    for column in design.columns:
+        candidate = design[independent_columns + [column]].to_numpy(dtype=float)
+        if account_for_constant:
+            candidate = np.column_stack([constant, candidate])
+        rank = np.linalg.matrix_rank(candidate)
+        if rank > current_rank:
+            independent_columns.append(column)
+            current_rank = rank
+    return design[independent_columns]
+
+
+def _fit_bootstrap_ordered_model(
+    model: Any, *, start_params: np.ndarray | None = None
+) -> Any:
+    """Fit one bootstrap model without unused Hessian-based inference."""
+    options: dict[str, Any] = {
+        "method": "bfgs",
+        "disp": False,
+        "skip_hessian": True,
+    }
+    if start_params is not None:
+        options["start_params"] = start_params
+    return model.fit(**options)
+
+
 def retrospective_ordinal_analysis(
     frame: pd.DataFrame,
     output_dir: str | Path,
@@ -369,11 +410,13 @@ def retrospective_ordinal_analysis(
                 axis=1,
             )
             design = design.loc[:, design.nunique() > 1]
-            # Remove exact linear dependencies (for example total counts vs.
-            # per-strategy counts) and any implicit constant before fitting an
-            # unregularised ordinal model with internally estimated thresholds.
-            independent_columns = _independent_columns_without_constant(design)
-            design = design[independent_columns]
+            # Remove exact dependencies (for example total counts vs.
+            # per-strategy counts), including combinations that span an
+            # implicit constant. OrderedModel rejects such a design because its
+            # thresholds already take the place of an intercept.
+            design = _drop_linearly_dependent_columns(
+                design, account_for_constant=True
+            )
             retained_features = [
                 feature for feature in varying_features if feature in design
             ]
@@ -414,13 +457,9 @@ def retrospective_ordinal_analysis(
                 if sampled_y.nunique() < 2:
                     continue
                 try:
-                    sampled_fit = OrderedModel(
-                        sampled_y, sampled_x, distr="logit"
-                    ).fit(
-                        method="bfgs",
+                    sampled_fit = _fit_bootstrap_ordered_model(
+                        OrderedModel(sampled_y, sampled_x, distr="logit"),
                         start_params=fitted.params.to_numpy(dtype=float),
-                        disp=False,
-                        skip_hessian=True,
                     )
                     if not sampled_fit.mle_retvals.get("converged", False):
                         continue
