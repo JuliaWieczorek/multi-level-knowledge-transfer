@@ -362,6 +362,10 @@ but all selected temporal target models must be trained again.
 
 ## Reproducibility and data policy
 
+Start with [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the preservation and
+evidence checklist. The Windows publication-closeout procedure is documented in
+[`PUBLICATION_CLOSEOUT_WINDOWS_PL.md`](PUBLICATION_CLOSEOUT_WINDOWS_PL.md).
+
 - Conversation splits are assigned before checkpoint expansion.
 - ESConv validation/test rows never inform target-style pattern extraction.
 - MEISD start/end segments remain in one source split.
