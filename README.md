@@ -1,5 +1,9 @@
 # Multi-Level Knowledge Transfer for Temporal Emotion Intensity Forecasting
 
+## Dissertation relationship
+
+This repository supports Chapter 6, *Multi-Level Knowledge Transfer for Temporal Emotion-Intensity Outcome Forecasting*, of the PhD dissertation *Knowledge Transfer for Emotion Intensity Prediction in Mental Health Support Dialogues*. It contains the temporal outcome-forecasting study described in that chapter.
+
 Research code for the final study of the PhD dissertation *Knowledge Transfer
 for Emotion Intensity Prediction in Mental Health Support Dialogues*.
 
